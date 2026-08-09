@@ -1,9 +1,14 @@
-# agents/orchestrator/state.py
-from typing import TypedDict, Optional
-from langgraph.graph import add_messages
-from typing_extensions import Annotated
+"""
+RunState is the single object that flows through every node in the graph.
+Each node reads what it needs from it and returns an updated copy with its
+own results added. Nothing is shared between nodes except through this object.
+"""
 
-class RunState(TypedDict):
+from typing import TypedDict, Optional
+
+
+class RunState(TypedDict, total=False):
+    # set at the start, from the incoming test.requested event
     run_id: str
     tenant_id: str
     project_id: str
@@ -11,18 +16,23 @@ class RunState(TypedDict):
     prompt: str
     correlation_id: str
 
-    # filled in progressively by each node
-    requirements_context: Optional[list[str]]
-    playwright_script: Optional[str]
-    scenario_count: Optional[int]
+    # filled in by scenario node
+    requirements_context: list[str]
+    playwright_script: str
 
-    execution_results: Optional[list[dict]]     # per-page: loadTime, consoleErrors, dom_s3_path, screenshot_s3_path
-    visual_diffs: Optional[list[dict]]           # per-page diff results
+    # filled in by execution node
+    execution_results: list[dict]
 
-    root_cause: Optional[str]
-    severity: Optional[str]
-    recommendation: Optional[str]
+    # filled in by visual analysis node
+    visual_diffs: list[dict]
 
-    report_url: Optional[str]
-    status: str    # mirrors test_runs.status in Postgres
+    # filled in by analysis node
+    root_cause: str
+    severity: str
+    recommendation: str
+
+    # filled in by reporting node
+    report_url: str
+
+    status: str      # queued -> scenario_generated -> executing -> analyzing -> completed/failed
     error: Optional[str]

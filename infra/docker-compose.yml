@@ -11,6 +11,9 @@ services:
       - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
+      # Anything in init-db/ runs ONCE, automatically, the first time this container
+      # is created with an empty data volume. This is how schema.sql gets applied.
+      - ./init-db:/docker-entrypoint-initdb.d
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0

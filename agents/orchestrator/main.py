@@ -1,24 +1,41 @@
-# agents/orchestrator/main.py
-import json, uuid
+"""
+orchestrator - THE entry point for the whole AI agent pipeline.
+
+Run it with:  python main.py
+(from inside the agents/orchestrator/ folder - see README.md)
+
+It listens for `test.requested` events on Kafka, runs the full LangGraph
+pipeline (scenario -> execution -> visual analysis -> analysis -> reporting),
+and publishes `report.ready` when done.
+"""
+
+import json
+import os
+
+from dotenv import load_dotenv
+load_dotenv()
+
 from kafka import KafkaConsumer, KafkaProducer
-from qdrant_client import QdrantClient
 from graph import build_graph
 
-qdrant = QdrantClient(url="http://localhost:6333")
-graph = build_graph(qdrant)
+graph = build_graph()
+
 producer = KafkaProducer(
-    bootstrap_servers="localhost:9092",
+    bootstrap_servers=os.environ["KAFKA_BROKER"],
     value_serializer=lambda v: json.dumps(v).encode("utf-8"),
 )
 
+
 def handle_test_requested(event: dict):
+    print(f"\n=== starting run {event['runId']} ===")
+
     initial_state = {
         "run_id": event["runId"],
         "tenant_id": event["tenantId"],
         "project_id": event["projectId"],
         "url": event["url"],
         "prompt": event["prompt"],
-        "correlation_id": event["correlationId"],
+        "correlation_id": event.get("correlationId"),
         "status": "queued",
     }
 
@@ -30,20 +47,29 @@ def handle_test_requested(event: dict):
         "projectId": final_state["project_id"],
         "runId": final_state["run_id"],
         "reportUrl": final_state.get("report_url"),
-        "criticalCount": 1 if final_state.get("severity") == "critical" else 0,
-        "warningCount": 1 if final_state.get("severity") == "warning" else 0,
-        "correlationId": final_state["correlation_id"],
+        "severity": final_state.get("severity"),
+        "correlationId": final_state.get("correlation_id"),
     })
+    producer.flush()
+
+    print(f"=== run {event['runId']} finished: {final_state['status']} ===\n")
+
 
 def main():
     consumer = KafkaConsumer(
         "test.requested",
-        bootstrap_servers="localhost:9092",
+        bootstrap_servers=os.environ["KAFKA_BROKER"],
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
         group_id="orchestrator",
+        auto_offset_reset="earliest",
     )
+    print("[orchestrator] waiting for test.requested events...")
     for msg in consumer:
-        handle_test_requested(msg.value)
+        try:
+            handle_test_requested(msg.value)
+        except Exception as e:
+            print(f"[orchestrator] run {msg.value.get('runId')} crashed: {e}")
+
 
 if __name__ == "__main__":
     main()

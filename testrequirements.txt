@@ -1,0 +1,5 @@
+Users can log in with their email and password.
+
+Users can reset their password via a 'Forgot password' link on the login page.
+
+After 3 failed login attempts, the account is locked for 15 minutes.
