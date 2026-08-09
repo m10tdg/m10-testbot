@@ -31,7 +31,7 @@ def reporting_agent_node(state: dict) -> dict:
         url=state["url"],
         severity=state.get("severity", "info"),
         recommendation=state.get("recommendation", "No issues detected."),
-        visual_diffs=state.get("visual_diffs", []),
+        visual_diffs=state.get("visual_diffs") or [],
     )
 
     key = f"{state['tenant_id']}/{state['project_id']}/{state['run_id']}/report.html"

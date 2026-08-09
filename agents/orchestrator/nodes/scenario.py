@@ -7,10 +7,9 @@ test intent, write the BODY of a Python function using Playwright's SYNC API.
 
 Rules:
 - Do NOT write the function signature, imports, or browser setup - ONLY the body.
-- The body receives a variable `page` (an already-open Playwright Page, already
-  navigated to the target URL) and a variable `console_errors` (a list you can read,
-  already being populated for you).
-- Use resilient selectors: page.get_by_role(...), page.get_by_text(...), not brittle CSS.
+- The body receives a variable `page` (an already-open Playwright Page) and `console_errors`.
+- Use resilient locators: page.get_by_role(...), page.get_by_text(...).
+- NEVER call non-existent attributes like .selector on Playwright Locator objects.
 - End with at least one assert statement tied to the test intent.
 - Return ONLY Python code. No markdown fences, no prose, no explanation.
 """
@@ -39,7 +38,7 @@ Relevant project context:
 """
 
     completion = openai.chat.completions.create(
-        model="gpt-4.1",
+        model="gpt-4o",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
