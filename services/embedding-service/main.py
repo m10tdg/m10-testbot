@@ -1,27 +1,63 @@
-# services/embedding-service/main.py
+"""
+embedding-service
+-----------------
+Listens for `document.uploaded` events on Kafka. For each one:
+  1. downloads the document from S3 (Localstack locally)
+  2. chunks the text
+  3. embeds each chunk with OpenAI
+  4. writes the vectors into the project's Qdrant collection
+  5. publishes `knowledge.indexed`
+
+Run it with:  python main.py
+(see README.md for full step-by-step instructions)
+"""
+
 import json
+import os
+import uuid
+
+from dotenv import load_dotenv
+load_dotenv()
+
+import boto3
+import openai
 from kafka import KafkaConsumer, KafkaProducer
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
-import boto3
-import uuid
-import openai
 
-s3 = boto3.client("s3", endpoint_url="http://localhost:4566")  # swap for real S3 in prod
-qdrant = QdrantClient(url="http://localhost:6333")
+openai.api_key = os.environ["OPENAI_API_KEY"]
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=os.environ["S3_ENDPOINT"],
+    aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+    aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+    region_name=os.environ["AWS_REGION"],
+)
+
+qdrant = QdrantClient(url=os.environ["QDRANT_URL"])
+
 producer = KafkaProducer(
-    bootstrap_servers="localhost:9092",
+    bootstrap_servers=os.environ["KAFKA_BROKER"],
     value_serializer=lambda v: json.dumps(v).encode("utf-8"),
 )
 
-def semantic_chunk(text: str, max_tokens: int = 500) -> list[str]:
-    """Chunk on paragraph boundaries first, then hard-split anything still too long.
-    Naive but predictable — swap for a proper sentence-aware splitter (e.g. langchain's
-    RecursiveCharacterTextSplitter) once this pipeline is proven end-to-end."""
+
+def extract_text(raw_bytes: bytes, filename: str) -> str:
+    """v1: plain text files only. We'll add PDF/DOCX extraction in a later step -
+    for now, upload a .txt file to test the pipeline end to end."""
+    if filename.lower().endswith(".txt"):
+        return raw_bytes.decode("utf-8", errors="ignore")
+    raise ValueError(f"Unsupported file type for '{filename}'. Use a .txt file for now.")
+
+
+def semantic_chunk(text: str, max_words: int = 200) -> list[str]:
+    """Chunk on blank-line paragraph boundaries, merging short paragraphs together
+    up to max_words. Simple and predictable - good enough to prove the pipeline works."""
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
     chunks, current = [], ""
     for p in paragraphs:
-        if len((current + " " + p).split()) > max_tokens:
+        if len((current + " " + p).split()) > max_words:
             if current:
                 chunks.append(current)
             current = p
@@ -29,34 +65,31 @@ def semantic_chunk(text: str, max_tokens: int = 500) -> list[str]:
             current = f"{current} {p}".strip()
     if current:
         chunks.append(current)
-    return chunks
+    return chunks or [text.strip()]
+
 
 def embed(text: str) -> list[float]:
     resp = openai.embeddings.create(model="text-embedding-3-small", input=text)
     return resp.data[0].embedding
 
-def classify_chunk_type(text: str) -> str:
-    """Cheap heuristic first (keyword match), fall back to an LLM call only when ambiguous —
-    don't burn a model call classifying every chunk when a regex gets you 90% of the way."""
-    lowered = text.lower()
-    if "as a user" in lowered or "i want to" in lowered:
-        return "user_story"
-    if "given" in lowered and "when" in lowered and "then" in lowered:
-        return "acceptance_criteria"
-    return "requirement"
 
 def handle_document_uploaded(event: dict):
-    tenant_id, project_id, doc_id = event["tenantId"], event["projectId"], event["documentId"]
+    tenant_id = event["tenantId"]
+    project_id = event["projectId"]
+    doc_id = event["documentId"]
+    s3_path = event["s3Path"]
     collection = f"{tenant_id}_{project_id}"
 
-    # 1. Download from S3
-    obj = s3.get_object(Bucket="m10-documents", Key=event["s3Path"])
-    raw_text = extract_text(obj["Body"].read(), event["s3Path"])  # pdf/docx extraction helper
+    print(f"[embedding-service] processing document {doc_id} -> collection {collection}")
 
-    # 2. Chunk
-    chunks = semantic_chunk(raw_text)
+    obj = s3.get_object(Bucket=os.environ["S3_DOCUMENTS_BUCKET"], Key=s3_path)
+    raw_bytes = obj["Body"].read()
+    filename = s3_path.split("/")[-1]
+    text = extract_text(raw_bytes, filename)
 
-    # 3. Embed + upsert
+    chunks = semantic_chunk(text)
+    print(f"[embedding-service] split into {len(chunks)} chunk(s)")
+
     points = []
     for i, chunk in enumerate(chunks):
         points.append(PointStruct(
@@ -67,37 +100,41 @@ def handle_document_uploaded(event: dict):
                 "project_id": project_id,
                 "document_id": doc_id,
                 "chunk_index": i,
-                "chunk_type": classify_chunk_type(chunk),
+                "type": "requirement",
                 "text": chunk,
-                "type": "requirement",  # coarse type used by agents' retrieval filter
             },
         ))
-    qdrant.upsert(collection_name=collection, points=points)
 
-    # 4. Publish knowledge.indexed
+    qdrant.upsert(collection_name=collection, points=points)
+    print(f"[embedding-service] wrote {len(points)} vector(s) into '{collection}'")
+
     producer.send("knowledge.indexed", {
         "eventType": "knowledge.indexed",
         "tenantId": tenant_id,
         "projectId": project_id,
         "documentId": doc_id,
         "chunkCount": len(chunks),
-        "correlationId": event["correlationId"],
+        "correlationId": event.get("correlationId"),
     })
+    producer.flush()
+
 
 def main():
     consumer = KafkaConsumer(
         "document.uploaded",
-        bootstrap_servers="localhost:9092",
+        bootstrap_servers=os.environ["KAFKA_BROKER"],
         value_deserializer=lambda v: json.loads(v.decode("utf-8")),
         group_id="embedding-service",
+        auto_offset_reset="earliest",
     )
+    print("[embedding-service] waiting for document.uploaded events...")
     for msg in consumer:
         try:
             handle_document_uploaded(msg.value)
         except Exception as e:
-            # Never let one bad document take the consumer down — log, ack, move on.
-            # A dead-letter topic (document.uploaded.dlq) is worth adding once this works.
-            print(f"[embedding-service] failed on {msg.value.get('documentId')}: {e}")
+            # Never let one bad document crash the whole consumer.
+            print(f"[embedding-service] FAILED on {msg.value.get('documentId')}: {e}")
+
 
 if __name__ == "__main__":
     main()
