@@ -52,7 +52,8 @@ def execution_agent_node(state: dict) -> dict:
         "screenshot_s3_path": screenshot_key,
         "dom_s3_path": dom_key,
     }]
-
+    
+    print(f"[execution-agent] execution results: {execution_results}")
     print(f"[execution-agent] done. passed={passed}, consoleErrors={len(console_errors)}")
 
     return {

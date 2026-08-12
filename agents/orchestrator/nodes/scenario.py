@@ -36,7 +36,7 @@ Test intent: {state['prompt']}
 Relevant project context:
 {context_block}
 """
-
+    print(f"[scenario-agent] sending prompt to LLM:\n{user_prompt}")
     completion = openai.chat.completions.create(
         model="gpt-4o",
         messages=[
@@ -49,6 +49,8 @@ Relevant project context:
     script_body = completion.choices[0].message.content.strip()
     # Strip accidental markdown fences - LLMs do this even when told not to.
     script_body = script_body.removeprefix("```python").removeprefix("```").removesuffix("```").strip()
+
+    print(f"[scenario-agent] generated script:\n{script_body}")
 
     print(f"[scenario-agent] generated {len(script_body.splitlines())} line(s) of test code")
 

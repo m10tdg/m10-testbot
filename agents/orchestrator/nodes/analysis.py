@@ -7,6 +7,8 @@ def analysis_agent_node(state: dict) -> dict:
     failures = [r for r in state["execution_results"] if not r.get("passed", True)]
     visual_issues = [d for d in state.get("visual_diffs", []) if d["verdict"] == "needs_review"]
 
+    print(f"[analysis-agent] found {len(failures)} test failures and {len(visual_issues)} visual issues")
+
     if not failures and not visual_issues:
         print("[analysis-agent] no issues found")
         return {
@@ -35,6 +37,8 @@ Be specific about which page/element is affected."""
 
     severity = "critical" if failures else "warning"
     print(f"[analysis-agent] severity={severity}")
+
+    print(f"[analysis-agent] root cause analysis:\n{analysis_text}")
 
     return {
         **state,

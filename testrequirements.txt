@@ -1,5 +1,5 @@
-Users can log in with their email and password.
+Load Time: Measure how long the authentication service takes to process a request (should be < 2 seconds for a seamless experience).
 
-Users can reset their password via a 'Forgot password' link on the login page.
+Responsiveness: Verify that the login page layout scales correctly on mobile (essential for a booking app, as many users book tickets on the go) and desktop browsers.
 
-After 3 failed login attempts, the account is locked for 15 minutes.
+Browser Compatibility: Ensure the login form works consistently across major browsers (Chrome, Firefox, Safari, Edge).
