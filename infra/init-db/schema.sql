@@ -48,7 +48,11 @@ CREATE TABLE test_runs (
 CREATE TABLE reports (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   tenant_id UUID NOT NULL REFERENCES tenants(id),
+  project_id UUID NOT NULL REFERENCES projects(id),
   run_id UUID NOT NULL REFERENCES test_runs(id),
+  status TEXT NOT NULL DEFAULT 'completed',
+  severity TEXT,
+  report_url TEXT NOT NULL,
   s3_path TEXT NOT NULL,
   format TEXT NOT NULL DEFAULT 'html',
   critical_count INT DEFAULT 0,

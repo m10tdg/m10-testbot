@@ -7,10 +7,11 @@ import openai
 import psycopg2
 from qdrant_client import QdrantClient
 
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+openai.api_key = OPENAI_API_KEY
+
 pg_conn = psycopg2.connect(os.environ["DATABASE_URL"])
 pg_conn.autocommit = True
-
-openai.api_key = os.environ["OPENAI_API_KEY"]
 
 qdrant = QdrantClient(url=os.environ["QDRANT_URL"])
 

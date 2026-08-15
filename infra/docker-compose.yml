@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: testbot
       POSTGRES_DB: testbot
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
       # Anything in init-db/ runs ONCE, automatically, the first time this container
