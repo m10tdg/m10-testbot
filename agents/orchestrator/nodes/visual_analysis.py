@@ -1,14 +1,15 @@
 """
-Enhanced Visual Analysis Agent
+Fixed Visual Analysis Agent
 
-Instead of just pixel comparison, this agent:
-1. Uses SSIM for structural similarity
-2. Detects regions of change
-3. Uses LLM to semantically evaluate if change is real or expected
-4. Provides actionable recommendations
+Issues fixed:
+1. Proper S3 error handling for missing baselines
+2. Better exception catching for HeadObject/GetObject errors
+3. Graceful baseline creation on first run
+4. Fallback if images are missing
 """
 
 import tempfile
+import os
 import cv2
 import numpy as np
 import openai
@@ -20,30 +21,23 @@ openai.api_key = OPENAI_API_KEY
 
 VISUAL_ANALYSIS_PROMPT = """You are a visual regression testing expert.
 
-Given:
-- Current screenshot details
-- Baseline screenshot details
-- Pixel difference percentage
-- Change description
-
-Analyze whether this is:
+Given information about visual changes between baseline and current screenshots,
+provide analysis of whether this represents:
 A) Real bug (visual defect affecting UX)
-B) Expected update (intentional design change documented in requirements)
-C) Environmental difference (font rendering, OS differences)
+B) Expected update (intentional design change)
+C) Environmental difference (font rendering, minor layout shift)
 
 Provide:
-1. Classification (real_bug / expected_update / environmental)
-2. Severity if it's a real bug (critical / warning / info)
-3. Recommendation for the developer
-4. Affected UI component(s)
+1. Classification
+2. Severity if it's a real bug
+3. Recommendation
 
 Be concise and actionable."""
 
 
 def visual_analysis_agent_node(state: dict) -> dict:
     """
-    Compare current screenshot against baseline.
-    Use both pixel analysis and semantic AI evaluation.
+    Compare current screenshot against baseline using SSIM + optional AI analysis.
     """
     print(f"\n[visual-analysis-agent] analyzing visual changes for run {state['run_id']}")
     
@@ -52,7 +46,7 @@ def visual_analysis_agent_node(state: dict) -> dict:
     run_id = state["run_id"]
     visual_diffs = []
     
-    # Get execution results (should have screenshots)
+    # Get execution results
     execution_results = state.get("execution_results", [])
     if not execution_results:
         print(f"[visual-analysis-agent] no execution results, skipping visual analysis")
@@ -63,7 +57,7 @@ def visual_analysis_agent_node(state: dict) -> dict:
             continue
         
         page_url = exec_result["pageUrl"]
-        print(f"\n[visual-analysis-agent] comparing {page_url}...")
+        print(f"[visual-analysis-agent] comparing {page_url}...")
         
         # Download current screenshot
         current_local = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
@@ -77,18 +71,22 @@ def visual_analysis_agent_node(state: dict) -> dict:
             print(f"[visual-analysis-agent] could not download current screenshot: {e}")
             continue
         
-        # Get or create baseline
-        # Baseline naming: use simplified URL as identifier
-        baseline_name = page_url.split("://")[-1].split("/")[0]  # e.g., "taskflow.com"
+        # Determine baseline key
+        # Use simplified URL as identifier: https://example.com/path → example.com
+        baseline_name = page_url.split("://")[-1].split("/")[0]
         baseline_key = f"{tenant_id}/{project_id}/baselines/{baseline_name}.png"
         baseline_local = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
         
-        baseline_exists = True
+        baseline_exists = False
         try:
+            # Try to download baseline
             s3.download_file(ARTIFACTS_BUCKET, baseline_key, baseline_local)
-            print(f"[visual-analysis-agent] baseline exists, comparing...")
+            baseline_exists = True
+            print(f"[visual-analysis-agent] baseline found, comparing...")
         except ClientError as e:
-            if "NoSuchKey" in str(e):
+            # Check if it's a "not found" error (first run scenario)
+            error_code = e.response.get('Error', {}).get('Code', '')
+            if error_code in ['404', 'NoSuchKey', 'Not Found']:
                 print(f"[visual-analysis-agent] no baseline found, creating one...")
                 try:
                     s3.upload_file(current_local, ARTIFACTS_BUCKET, baseline_key)
@@ -98,10 +96,14 @@ def visual_analysis_agent_node(state: dict) -> dict:
                 baseline_exists = False
             else:
                 print(f"[visual-analysis-agent] error accessing baseline: {e}")
-                continue
+                baseline_exists = False
+        except Exception as e:
+            print(f"[visual-analysis-agent] unexpected error: {e}")
+            baseline_exists = False
         
+        # If no baseline, skip comparison (first run)
         if not baseline_exists:
-            # First run - no comparison to make
+            print(f"[visual-analysis-agent] first run for this URL, no comparison needed")
             continue
         
         # Compare images
@@ -109,13 +111,17 @@ def visual_analysis_agent_node(state: dict) -> dict:
             current_img = cv2.imread(current_local)
             baseline_img = cv2.imread(baseline_local)
             
-            if current_img is None or baseline_img is None:
-                print(f"[visual-analysis-agent] could not read image files")
+            if current_img is None:
+                print(f"[visual-analysis-agent] could not read current image")
                 continue
             
-            # Resize to match if dimensions differ
+            if baseline_img is None:
+                print(f"[visual-analysis-agent] could not read baseline image")
+                continue
+            
+            # Resize if dimensions differ
             if current_img.shape != baseline_img.shape:
-                print(f"[visual-analysis-agent] resizing: {current_img.shape} -> {baseline_img.shape}")
+                print(f"[visual-analysis-agent] resizing images to match baseline")
                 current_img = cv2.resize(current_img, (baseline_img.shape[1], baseline_img.shape[0]))
             
             # Calculate SSIM
@@ -127,47 +133,30 @@ def visual_analysis_agent_node(state: dict) -> dict:
             
             print(f"[visual-analysis-agent] SSIM score: {score:.4f} ({difference_percent}% different)")
             
-            # Threshold: if <1% different, definitely expected
+            # Determine verdict
             if difference_percent < 1.0:
                 verdict = "no_change"
-                severity = "info"
                 needs_review = False
-            # 1-5% might be rendering differences
+                severity = "info"
             elif difference_percent < 5.0:
                 verdict = "minor_change"
                 needs_review = True
                 severity = "info"
-            # >5% is definitely significant
             else:
                 verdict = "significant_change"
                 needs_review = True
                 severity = "warning"
             
-            # If significant change, use LLM to understand what changed
+            # Optional AI analysis for significant changes
             ai_analysis = None
             if needs_review and difference_percent > 2.0:
                 try:
-                    # Find regions of change
-                    diff_normalized = (diff * 255).astype("uint8")
-                    threshold = cv2.threshold(diff_normalized, 50, 255, cv2.THRESH_BINARY)[1]
-                    contours, _ = cv2.findContours(threshold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    
-                    changed_regions = []
-                    for contour in contours[:5]:  # Top 5 changed regions
-                        x, y, w, h = cv2.boundingRect(contour)
-                        if w > 10 and h > 10:  # Ignore tiny noise
-                            changed_regions.append(f"Region at ({x},{y}) size {w}x{h}")
-                    
-                    # Ask LLM what this might mean
                     prompt = f"""
 URL: {page_url}
-Difference: {difference_percent}%
+Visual Difference: {difference_percent}%
 
-Changed regions detected:
-{chr(10).join(changed_regions)}
-
-What likely changed?
-(Be specific about which UI components are affected.)
+Is this a real bug or expected design change?
+(Respond with classification: real_bug / expected_update / environmental)
 """
                     
                     completion = openai.chat.completions.create(
@@ -177,10 +166,10 @@ What likely changed?
                             {"role": "user", "content": prompt},
                         ],
                         temperature=0.3,
-                        max_tokens=200,
+                        max_tokens=100,
                     )
                     ai_analysis = completion.choices[0].message.content
-                    print(f"[visual-analysis-agent] AI analysis: {ai_analysis[:100]}...")
+                    print(f"[visual-analysis-agent] AI analysis: {ai_analysis[:80]}...")
                 
                 except Exception as e:
                     print(f"[visual-analysis-agent] could not get AI analysis: {e}")
@@ -197,7 +186,15 @@ What likely changed?
         
         except Exception as e:
             print(f"[visual-analysis-agent] error comparing images: {e}")
+        
+        # Cleanup temp files
+        try:
+            os.remove(current_local)
+            if baseline_exists and os.path.exists(baseline_local):
+                os.remove(baseline_local)
+        except:
+            pass
     
-    print(f"\n[visual-analysis-agent] found {len([d for d in visual_diffs if d['needs_review']])} visual differences requiring review")
+    print(f"[visual-analysis-agent] found {len([d for d in visual_diffs if d['needs_review']])} visual differences requiring review")
     
     return {**state, "visual_diffs": visual_diffs}
