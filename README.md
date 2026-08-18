@@ -1,12 +1,7 @@
-# TESTBOT — Local Development, Step by Step
-
-Follow this top to bottom, in order. **Do not skip ahead** — each step proves the
-previous one worked before you build on top of it. Every step tells you exactly
-what command to run and exactly what you should see.
+# TESTBOT — Local Development
 
 You will end up with **4 terminal windows open** (one per running service) plus
-the one you're typing setup commands into. That's normal — this is what a
-microservices system looks like when you run it locally.
+the one you're typing setup commands into.
 
 ---
 
@@ -318,43 +313,3 @@ curl http://localhost:4566/m10-artifacts/11111111-1111-1111-1111-111111111111/<P
 ```
 
 That's raw HTML — paste it into a `.html` file and open it in a browser to see it rendered.
-
----
-
-## What you've actually built by the end of this
-
-A real event chain: **upload a document → it gets embedded into a per-project vector
-database → you trigger a test with a plain-English prompt → an AI agent retrieves your
-project's requirements, writes a test script, runs it in a real browser, checks for
-visual regressions, analyzes the result, and produces a report** — the entire loop
-from your architecture doc, running on your machine.
-
----
-
-## If something breaks
-
-- **A service won't start / "port already in use":** something else is using that
-  port, or you already have that service running in another terminal. Check with
-  `lsof -i :<port>` (Mac/Linux) and kill the old process.
-- **Kafka consumer sees nothing:** check Kafka UI (localhost:8085) → Topics → does
-  your topic have messages? If yes but your service isn't picking them up, restart
-  that service — `auto_offset_reset="earliest"` means a fresh consumer group will
-  read from the beginning, but the group ID only gets created once.
-- **OpenAI errors ("invalid API key" etc.):** double check `.env` in
-  `embedding-service` AND `agents/orchestrator` both have your real key, and that you
-  ran `source venv/bin/activate` before `pip install` / `python main.py` in that
-  same terminal (otherwise it may be using a different Python).
-- **Playwright errors about missing browser:** re-run `playwright install chromium`
-  inside the orchestrator's virtualenv.
-
----
-
-## Next steps (once everything above works)
-
-Once you've run this end to end and it makes sense, the next additions — in order —
-are: (1) real document types beyond `.txt` (PDF/DOCX extraction), (2) Cognito auth
-replacing the "pass tenantId in the body" placeholder, (3) moving the Execution
-Agent's browser automation into an isolated Kubernetes Job instead of running inline,
-(4) Docker Compose-ing all of *your own* services together instead of running each
-in a separate terminal, (5) deploying to real AWS. We'll tackle these one at a time,
-the same way — build it, run it, see it work, then move on.

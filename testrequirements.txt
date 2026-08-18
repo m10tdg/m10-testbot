@@ -1,5 +1,0 @@
-Load Time: Measure how long the authentication service takes to process a request (should be < 2 seconds for a seamless experience).
-
-Responsiveness: Verify that the login page layout scales correctly on mobile (essential for a booking app, as many users book tickets on the go) and desktop browsers.
-
-Browser Compatibility: Ensure the login form works consistently across major browsers (Chrome, Firefox, Safari, Edge).
