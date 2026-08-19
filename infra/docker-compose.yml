@@ -4,35 +4,25 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: ${DB_USER:-testbot}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-testbot}
-      POSTGRES_DB: ${DB_NAME:-testbot}
+      POSTGRES_USER: testbot
+      POSTGRES_PASSWORD: testbot
+      POSTGRES_DB: testbot
     ports:
       - "5433:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
-      - ./infra/init-db:/docker-entrypoint-initdb.d
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U testbot"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      # Anything in init-db/ runs ONCE, automatically, the first time this container
+      # is created with an empty data volume. This is how schema.sql gets applied.
+      - ./init-db:/docker-entrypoint-initdb.d
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
-    healthcheck:
-      test: ["CMD", "echo", "ruok"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   kafka:
     image: confluentinc/cp-kafka:7.6.0
-    depends_on:
-      zookeeper:
-        condition: service_healthy
+    depends_on: [zookeeper]
     ports:
       - "9092:9092"
     environment:
@@ -42,17 +32,10 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-    healthcheck:
-      test: ["CMD", "kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
-    depends_on:
-      kafka:
-        condition: service_healthy
+    depends_on: [kafka]
     ports:
       - "8085:8080"
     environment:
@@ -66,110 +49,16 @@ services:
       - "6334:6334"
     volumes:
       - qdrant_data:/qdrant/storage
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   localstack:
     image: localstack/localstack:latest
     ports:
       - "4566:4566"
     environment:
-      LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:-}
-      AWS_DEFAULT_REGION: ${AWS_REGION:-eu-central-1}
+      - LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_AUTH_TOKEN}
+      - AWS_DEFAULT_REGION=eu-central-1
     volumes:
       - localstack_data:/var/lib/localstack
-    healthcheck:
-      test: ["CMD", "awslocal", "kinesis", "list-streams"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  orchestrator:
-    build:
-      context: ./agents/orchestrator
-      dockerfile: Dockerfile
-    depends_on:
-      postgres:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
-      qdrant:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://testbot:testbot@postgres:5432/testbot
-      KAFKA_BROKER: kafka:29092
-      QDRANT_URL: http://qdrant:6333
-      AWS_ENDPOINT_URL: http://localstack:4566
-      CI_INTEGRATION_SERVICE_URL: http://ci-integration-service:3000
-      DOCUMENT_SERVICE_URL: http://document-service:3000
-    ports:
-      - "8000:8000"
-    restart: on-failure
-
-  ci-integration-service:
-    build:
-      context: ./services/ci-integration-service
-      dockerfile: Dockerfile
-    depends_on:
-      postgres:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://testbot:testbot@postgres:5432/testbot
-      KAFKA_BROKER: kafka:29092
-      NODE_ENV: production
-    ports:
-      - "3001:3000"
-    restart: on-failure
-
-  document-service:
-    build:
-      context: ./services/document-service
-      dockerfile: Dockerfile
-    depends_on:
-      postgres:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://testbot:testbot@postgres:5432/testbot
-      KAFKA_BROKER: kafka:29092
-      AWS_ENDPOINT_URL: http://localstack:4566
-      NODE_ENV: production
-    ports:
-      - "3002:3000"
-    restart: on-failure
-
-  project-service:
-    build:
-      context: ./services/project-service
-      dockerfile: Dockerfile
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://testbot:testbot@postgres:5432/testbot
-      NODE_ENV: production
-    ports:
-      - "3003:3000"
-    restart: on-failure
-
-  embedding-service:
-    build:
-      context: ./services/embedding-service
-      dockerfile: Dockerfile
-    depends_on:
-      qdrant:
-        condition: service_healthy
-    environment:
-      QDRANT_URL: http://qdrant:6333
-    ports:
-      - "5000:5000"
-    restart: on-failure
 
 volumes:
   pg_data:
