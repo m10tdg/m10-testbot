@@ -1,64 +1,192 @@
-version: "3.9"
-
 services:
+
   postgres:
     image: postgres:16
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: testbot
-      POSTGRES_PASSWORD: testbot
-      POSTGRES_DB: testbot
-    ports:
-      - "5433:5432"
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - pg_data:/var/lib/postgresql/data
-      # Anything in init-db/ runs ONCE, automatically, the first time this container
-      # is created with an empty data volume. This is how schema.sql gets applied.
       - ./init-db:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
+    restart: unless-stopped
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
 
   kafka:
     image: confluentinc/cp-kafka:7.6.0
-    depends_on: [zookeeper]
-    ports:
-      - "9092:9092"
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_started
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092
+
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-topics --bootstrap-server localhost:29092 --list >/dev/null 2>&1"
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
-    depends_on: [kafka]
-    ports:
-      - "8085:8080"
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
     environment:
-      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_NAME: production
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    ports:
+      - "127.0.0.1:8085:8080"
 
   qdrant:
     image: qdrant/qdrant:latest
-    ports:
-      - "6333:6333"
-      - "6334:6334"
+    restart: unless-stopped
     volumes:
       - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:6333/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   localstack:
     image: localstack/localstack:latest
-    ports:
-      - "4566:4566"
+    restart: unless-stopped
     environment:
-      - LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_AUTH_TOKEN}
-      - AWS_DEFAULT_REGION=eu-central-1
+      AWS_DEFAULT_REGION: ${AWS_REGION}
+    ports:
+      - "127.0.0.1:4566:4566"
     volumes:
       - localstack_data:/var/lib/localstack
+
+  project-service:
+    build:
+      context: ../services/project-service
+    restart: unless-stopped
+    environment:
+      PORT: 4001
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      QDRANT_URL: http://qdrant:6333
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:4001:4001"
+
+  document-service:
+    build:
+      context: ../services/document-service
+    restart: unless-stopped
+    environment:
+      PORT: 4002
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      KAFKA_BROKER: kafka:29092
+
+      S3_ENDPOINT: http://localstack:4566
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION}
+      S3_DOCUMENTS_BUCKET: ${S3_DOCUMENTS_BUCKET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      localstack:
+        condition: service_started
+    ports:
+      - "127.0.0.1:4002:4002"
+
+  ci-integration-service:
+    build:
+      context: ../services/ci-integration-service
+    restart: unless-stopped
+    environment:
+      PORT: 4003
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      KAFKA_BROKER: kafka:29092
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:4003:4003"
+
+  embedding-service:
+    build:
+      context: ../services/embedding-service
+    restart: unless-stopped
+    environment:
+      KAFKA_BROKER: kafka:29092
+      QDRANT_URL: http://qdrant:6333
+
+      S3_ENDPOINT: http://localstack:4566
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION}
+      S3_DOCUMENTS_BUCKET: ${S3_DOCUMENTS_BUCKET}
+
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      localstack:
+        condition: service_started
+
+  orchestrator:
+    build:
+      context: ../agents/orchestrator
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      KAFKA_BROKER: kafka:29092
+      QDRANT_URL: http://qdrant:6333
+
+      S3_ENDPOINT: http://localstack:4566
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION}
+      S3_ARTIFACTS_BUCKET: ${S3_ARTIFACTS_BUCKET}
+
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      localstack:
+        condition: service_started
 
 volumes:
   pg_data:
