@@ -63,12 +63,15 @@ services:
       - "127.0.0.1:8085:8080"
 
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.19.0
     restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:6333/"]
+      test: ["CMD-SHELL", "sh -c 'exec 3<>/dev/tcp/127.0.0.1/6333' >/dev/null 2>&1 && echo 0 || echo 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -78,10 +81,16 @@ services:
     restart: unless-stopped
     environment:
       AWS_DEFAULT_REGION: ${AWS_REGION}
+      LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN}
     ports:
       - "127.0.0.1:4566:4566"
     volumes:
       - localstack_data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD", "awslocal", "s3", "ls"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   project-service:
     build:
@@ -192,3 +201,7 @@ volumes:
   pg_data:
   qdrant_data:
   localstack_data:
+
+
+    
+
