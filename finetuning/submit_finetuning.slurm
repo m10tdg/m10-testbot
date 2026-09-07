@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=qwen-finetune
 #SBATCH --account=project_465003167
-#SBATCH --partition=gpu
+#SBATCH --partition=small-g
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=10
 #SBATCH --gpus-per-node=1
