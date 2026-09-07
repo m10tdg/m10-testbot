@@ -11,3 +11,5 @@ venv
 node_modules/
 __pycache__/
 *.pyc
+
+finetuning/qwen-finetune-env
