@@ -138,6 +138,7 @@ def execution_agent_node(state: dict) -> dict:
             if passed:
                 print(f"[execution-agent] executing test script...")
                 try:
+                    print("page:",page)
                     # Provide helper class to execution context
                     exec(state["playwright_script"], {
                         "page": page,

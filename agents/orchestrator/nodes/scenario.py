@@ -258,11 +258,12 @@ Make sure to:
         
         lines = script_body.split('\n')
         print(f"[scenario-agent] generated {len(lines)} lines of test code")
-        if len(lines) > 0:
-            print(f"[scenario-agent] first 5 lines:")
-            for line in lines[:5]:
-                if line.strip():
-                    print(f"  {line[:100]}")
+        print(f"[scenario-agent] script body: {script_body[:]}")
+        # if len(lines) > 0:
+        #     print(f"[scenario-agent] first 5 lines:")
+        #     for line in lines[:5]:
+        #         if line.strip():
+        #             print(f"  {line[:100]}")
         
         return {
             **state,
