@@ -108,7 +108,7 @@ check_accelerate()
 
 @check("Training data file exists")
 def check_training_data_exists():
-    training_file = Path("training_data.jsonl")
+    training_file = Path("/dataset/training_data.jsonl")
     if not training_file.exists():
         raise FileNotFoundError(
             f"training_data.jsonl not found in {Path.cwd()}\n"
