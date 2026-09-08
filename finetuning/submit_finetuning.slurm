@@ -10,22 +10,21 @@
 #SBATCH --output=/project/project_465003167/m10-testbot/finetuning/logs/slurm-%j.out
 #SBATCH --error=/project/project_465003167/m10-testbot/finetuning/logs/slurm-%j.err
 
-# Disable Slurm CPU auto-binding strictness for Python single-task jobs
 export SLURM_CPU_BIND="none"
 
-# Load modules
-module load LUMI/23.09
+# Use the current supported software stack on LUMI
+module purge
+module load LUMI/25.03
 module load cray-python
-module load rocm/5.7.0
+module load rocm
 
-# Activate virtual environment
-source /project/project_465003167/m10-testbot/finetuning/qwen-finetune-env/bin/activate
+# Set environment path explicitly before activating
+VENV_PATH="/project/project_465003167/m10-testbot/finetuning/qwen-finetune-env"
+export PATH="$VENV_PATH/bin:$PATH"
+source "$VENV_PATH/bin/activate"
 
-# Change to working directory
 cd /project/project_465003167/m10-testbot/finetuning
-
-# Ensure output logs directory exists
 mkdir -p logs
 
-# Execute with explicit cpu-bind parameter
+# Execute script via virtual environment python directly
 srun --cpu-bind=none python finetune_qwen.py
