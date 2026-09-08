@@ -57,11 +57,11 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     print(f"✓ Tokenizer loaded (vocab size: {len(tokenizer)})")
     
-    # Load model with explicit single GPU device map (Fixes device_map='auto' ROCm hang)
+    # Load model (using 'dtype' instead of 'torch_dtype' for transformers v5)
     print("\n[2/6] Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.bfloat16,  # Native format for AMD MI250X
+        dtype=torch.bfloat16,  # Native format for AMD MI250X
         device_map={"": 0},
         trust_remote_code=True,
     )
@@ -108,7 +108,7 @@ def main():
     dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
     print(f"✓ Training data loaded ({len(dataset)} examples)")
     
-    # Training arguments
+    # Training arguments (compatible with transformers v5)
     print("\n[5/6] Setting up training...")
     training_args = TrainingArguments(
         output_dir="/project/project_465003167/m10-testbot/qwen-finetuned",
@@ -122,9 +122,8 @@ def main():
         weight_decay=0.01,
         warmup_steps=10,
         lr_scheduler_type="linear",
-        logging_dir="/project/project_465003167/m10-testbot/logs",
         bf16=True,  # Native bfloat16 for AMD MI250X
-        gradient_checkpointing=False,  # Managed manually
+        gradient_checkpointing=False,  # Managed manually above
         max_grad_norm=1.0,
         report_to=["tensorboard"],
     )
