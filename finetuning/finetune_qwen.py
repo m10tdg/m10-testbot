@@ -81,7 +81,7 @@ def main():
     
     # Load training data
     print("\n[4/6] Loading training data...")
-    training_data_path = "training_data.jsonl"
+    training_data_path = "dataset/training_data.jsonl"
     if not Path(training_data_path).exists():
         raise FileNotFoundError(f"Training data not found at {training_data_path}")
     
