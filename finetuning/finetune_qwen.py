@@ -102,7 +102,7 @@ def main():
             max_length=MAX_SEQ_LENGTH,
             return_tensors="pt",
         )
-        outputs["labels"] = outputs["input_ids"].copy()
+        outputs["labels"] = outputs["input_ids"].clone()
         return outputs
     
     dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
