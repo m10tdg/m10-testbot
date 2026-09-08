@@ -7,13 +7,13 @@ import json
 import os
 import torch
 from pathlib import Path
-from datasets import Dataset, load_dataset
+from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     TrainingArguments,
     Trainer,
-    DataCollatorForSeq2Seq,
+    DataCollatorForLanguageModeling,
 )
 from peft import LoraConfig, get_peft_model
 
@@ -23,8 +23,8 @@ LORA_RANK = 16
 LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
 LEARNING_RATE = 2e-4
-BATCH_SIZE = 4  # Reduced for 14B model on GPU memory
-GRADIENT_ACCUMULATION = 2
+BATCH_SIZE = 2  # Set to 2 per device to safely fit 14B model + activation memory
+GRADIENT_ACCUMULATION = 4  # Keep effective batch size = 8
 NUM_EPOCHS = 3
 MAX_SEQ_LENGTH = 1024
 
@@ -34,7 +34,6 @@ def format_prompt(example):
     input_text = example.get('input', '')
     output = example.get('output', '')
     
-    # Format: [INST] instruction + input [/INST] output
     prompt = f"[INST] {instruction}\n\n{input_text} [/INST]\n{output}"
     return {"text": prompt}
 
@@ -43,7 +42,6 @@ def main():
     print("QWEN 2.5 14B FINE-TUNING ON LUMI")
     print("=" * 80)
     
-    # Check GPU availability
     print(f"\nGPU Available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"GPU Count: {torch.cuda.device_count()}")
@@ -59,7 +57,7 @@ def main():
     print("\n[2/6] Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,  # Optimal format for AMD MI250X
         device_map="auto",
         trust_remote_code=True,
     )
@@ -85,23 +83,23 @@ def main():
     if not Path(training_data_path).exists():
         raise FileNotFoundError(f"Training data not found at {training_data_path}")
     
-    # Load JSONL
     dataset = load_dataset("json", data_files=training_data_path)
     dataset = dataset["train"].map(format_prompt, remove_columns=["instruction", "input", "output"])
     
-    # Tokenize
     def tokenize_function(examples):
-        return tokenizer(
+        outputs = tokenizer(
             examples["text"],
             padding="max_length",
             truncation=True,
             max_length=MAX_SEQ_LENGTH,
             return_tensors="pt",
         )
+        # For Causal LM, labels are equal to input_ids
+        outputs["labels"] = outputs["input_ids"].copy()
+        return outputs
     
     dataset = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
     print(f"✓ Training data loaded ({len(dataset)} examples)")
-    print(f"  Sample: {dataset[0].keys()}")
     
     # Training arguments
     print("\n[5/6] Setting up training...")
@@ -116,11 +114,10 @@ def main():
         logging_steps=10,
         learning_rate=LEARNING_RATE,
         weight_decay=0.01,
-        warmup_steps=100,
+        warmup_steps=10,
         lr_scheduler_type="linear",
         logging_dir="/project/project_465003167/m10-testbot/logs",
-        use_cuda=torch.cuda.is_available(),
-        fp16=True,
+        bf16=True,  # Native bfloat16 for AMD Instinct MI250X GPUs
         gradient_checkpointing=True,
         max_grad_norm=1.0,
         report_to=["tensorboard"],
@@ -132,21 +129,14 @@ def main():
         model=model,
         args=training_args,
         train_dataset=dataset,
-        data_collator=DataCollatorForSeq2Seq(
+        data_collator=DataCollatorForLanguageModeling(
             tokenizer=tokenizer,
-            pad_to_multiple_of=8,
-            return_tensors="pt",
-            padding=True,
+            mlm=False,  # Causal LM (not masked LM)
         ),
     )
     
     # Train
     print("\n[6/6] Starting training...")
-    print(f"  Epochs: {NUM_EPOCHS}")
-    print(f"  Batch size: {BATCH_SIZE}")
-    print(f"  Learning rate: {LEARNING_RATE}")
-    print()
-    
     trainer.train()
     
     # Save
@@ -154,18 +144,12 @@ def main():
     print("TRAINING COMPLETE")
     print("=" * 80)
     
-    print("\n[SAVE] Saving fine-tuned model...")
     output_dir = "/project/project_465003167/m10-testbot/qwen-finetuned-final"
     os.makedirs(output_dir, exist_ok=True)
     
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
-    
     print(f"✓ Model saved to: {output_dir}")
-    print(f"\nTo use in your scenario agent:")
-    print(f"  model_path = '{output_dir}'")
-    print(f"  model = AutoModelForCausalLM.from_pretrained(model_path)")
-    print(f"  tokenizer = AutoTokenizer.from_pretrained(model_path)")
 
 if __name__ == "__main__":
     main()
