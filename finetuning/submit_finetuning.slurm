@@ -10,7 +10,10 @@
 #SBATCH --output=/project/project_465003167/m10-testbot/finetuning/logs/slurm-%j.out
 #SBATCH --error=/project/project_465003167/m10-testbot/finetuning/logs/slurm-%j.err
 
-# Load matching module tree for PyTorch built with ROCm 5.7
+# Disable Slurm CPU auto-binding strictness for Python single-task jobs
+export SLURM_CPU_BIND="none"
+
+# Load modules
 module load LUMI/23.09
 module load cray-python
 module load rocm/5.7.0
@@ -24,5 +27,5 @@ cd /project/project_465003167/m10-testbot/finetuning
 # Ensure output logs directory exists
 mkdir -p logs
 
-# Run fine-tuning script with srun
-srun python finetune_qwen.py
+# Execute with explicit cpu-bind parameter
+srun --cpu-bind=none python finetune_qwen.py
