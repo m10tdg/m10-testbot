@@ -112,7 +112,6 @@ def main():
     print("\n[5/6] Setting up training...")
     training_args = TrainingArguments(
         output_dir="/project/project_465003167/m10-testbot/qwen-finetuned",
-        overwrite_output_dir=True,
         num_train_epochs=NUM_EPOCHS,
         per_device_train_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION,
@@ -125,7 +124,7 @@ def main():
         lr_scheduler_type="linear",
         logging_dir="/project/project_465003167/m10-testbot/logs",
         bf16=True,  # Native bfloat16 for AMD MI250X
-        gradient_checkpointing=False,  # Managed manually above
+        gradient_checkpointing=False,  # Managed manually
         max_grad_norm=1.0,
         report_to=["tensorboard"],
     )
