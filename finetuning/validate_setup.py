@@ -145,7 +145,7 @@ check_training_data_format()
 
 @check("Training data size (minimum 50 examples)")
 def check_training_data_size():
-    with open("training_data.jsonl") as f:
+    with open("dataset/training_data.jsonl") as f:
         count = len(f.readlines())
     
     if count < 50:
