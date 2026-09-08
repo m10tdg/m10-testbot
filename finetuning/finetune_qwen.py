@@ -3,8 +3,12 @@
 Fine-tune Qwen2.5 14B on LUMI for Playwright scenario generation
 """
 
-import json
 import os
+# Disable bitsandbytes CUDA checks on AMD/ROCm
+os.environ["BITSANDBYTES_NOWELCOME"] = "1"
+os.environ["USE_BITSANDBYTES"] = "0"
+
+import json
 import torch
 from pathlib import Path
 from datasets import load_dataset
@@ -23,8 +27,8 @@ LORA_RANK = 16
 LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
 LEARNING_RATE = 2e-4
-BATCH_SIZE = 2  # Set to 2 per device to safely fit 14B model + activation memory
-GRADIENT_ACCUMULATION = 4  # Keep effective batch size = 8
+BATCH_SIZE = 2  # Per device to fit 14B model + activation memory
+GRADIENT_ACCUMULATION = 4  # Effective batch size = 8
 NUM_EPOCHS = 3
 MAX_SEQ_LENGTH = 1024
 
@@ -53,15 +57,19 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     print(f"✓ Tokenizer loaded (vocab size: {len(tokenizer)})")
     
-    # Load model
+    # Load model with explicit single GPU device map (Fixes device_map='auto' ROCm hang)
     print("\n[2/6] Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.bfloat16,  # Optimal format for AMD MI250X
-        device_map="auto",
+        torch_dtype=torch.bfloat16,  # Native format for AMD MI250X
+        device_map={"": 0},
         trust_remote_code=True,
     )
     print(f"✓ Model loaded ({MODEL_NAME})")
+    
+    # Enable gradient checkpointing BEFORE applying PEFT/LoRA
+    model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()
     
     # Setup LoRA
     print("\n[3/6] Setting up LoRA...")
@@ -94,7 +102,6 @@ def main():
             max_length=MAX_SEQ_LENGTH,
             return_tensors="pt",
         )
-        # For Causal LM, labels are equal to input_ids
         outputs["labels"] = outputs["input_ids"].copy()
         return outputs
     
@@ -117,8 +124,8 @@ def main():
         warmup_steps=10,
         lr_scheduler_type="linear",
         logging_dir="/project/project_465003167/m10-testbot/logs",
-        bf16=True,  # Native bfloat16 for AMD Instinct MI250X GPUs
-        gradient_checkpointing=True,
+        bf16=True,  # Native bfloat16 for AMD MI250X
+        gradient_checkpointing=False,  # Managed manually above
         max_grad_norm=1.0,
         report_to=["tensorboard"],
     )
@@ -131,7 +138,7 @@ def main():
         train_dataset=dataset,
         data_collator=DataCollatorForLanguageModeling(
             tokenizer=tokenizer,
-            mlm=False,  # Causal LM (not masked LM)
+            mlm=False,
         ),
     )
     

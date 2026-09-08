@@ -12,7 +12,16 @@
 
 export SLURM_CPU_BIND="none"
 
-# Use the current supported software stack on LUMI
+# Prevent PyTorch from querying CUDA-specific bitsandbytes modules
+export BITSANDBYTES_NOWELCOME=1
+export USE_BITSANDBYTES=0
+
+# Expose single GPU GCD on LUMI
+export HIP_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# Use software stack on LUMI
 module purge
 module load LUMI/25.03
 module load cray-python
@@ -26,5 +35,5 @@ source "$VENV_PATH/bin/activate"
 cd /project/project_465003167/m10-testbot/finetuning
 mkdir -p logs
 
-# Execute script via virtual environment python directly
+# Execute script via python directly inside task
 srun --cpu-bind=none python finetune_qwen.py
