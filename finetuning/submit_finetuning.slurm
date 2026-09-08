@@ -7,13 +7,13 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --mem=60G
 #SBATCH --time=02:00:00
-#SBATCH --output=/project/project_465003167/m10-testbot/logs/slurm-%j.out
-#SBATCH --error=/project/project_465003167/m10-testbot/logs/slurm-%j.err
+#SBATCH --output=/project/project_465003167/m10-testbot/finetuning/logs/slurm-%j.out
+#SBATCH --error=/project/project_465003167/m10-testbot/finetuning/logs/slurm-%j.err
 
-# Load modules
-module load LUMI/25.03
+# Load matching module tree for PyTorch built with ROCm 5.7
+module load LUMI/23.09
 module load cray-python
-module load rocm/6.3.4
+module load rocm/5.7.0
 
 # Activate virtual environment
 source /project/project_465003167/m10-testbot/finetuning/qwen-finetune-env/bin/activate
@@ -21,5 +21,8 @@ source /project/project_465003167/m10-testbot/finetuning/qwen-finetune-env/bin/a
 # Change to working directory
 cd /project/project_465003167/m10-testbot/finetuning
 
-# Run fine-tuning script
-python finetune_qwen.py
+# Ensure output logs directory exists
+mkdir -p logs
+
+# Run fine-tuning script with srun
+srun python finetune_qwen.py
