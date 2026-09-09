@@ -327,7 +327,6 @@ def main():
     
     training_args = TrainingArguments(
         output_dir="/project/project_465003167/m10-testbot/finetuning/qwen-finetuned",
-        overwrite_output_dir=True,
         num_train_epochs=NUM_EPOCHS,
         per_device_train_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION,
