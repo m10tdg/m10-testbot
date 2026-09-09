@@ -290,13 +290,16 @@ def main():
     
     # Tokenize training data
     def tokenize_function(examples):
-        return tokenizer(
+        model_inputs = tokenizer(
             examples["text"],
             padding="max_length",
             truncation=True,
             max_length=MAX_SEQ_LENGTH,
-            return_tensors="pt",
-        )
+            )
+
+        # Assign labels to match input_ids for causal language modeling
+        model_inputs["labels"] = model_inputs["input_ids"].copy()
+        return model_inputs
     
     training_dataset = training_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
     
