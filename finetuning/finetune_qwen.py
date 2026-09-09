@@ -256,7 +256,7 @@ def main():
     print("\n[2/7] Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
     )
@@ -341,7 +341,8 @@ def main():
         weight_decay=0.01,
         warmup_steps=100,
         lr_scheduler_type="linear",
-        fp16=True,
+        bf16=True,
+        fp16=False,
         gradient_checkpointing=True,
         max_grad_norm=1.0,
         report_to=["tensorboard"],
