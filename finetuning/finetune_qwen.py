@@ -338,8 +338,6 @@ def main():
         weight_decay=0.01,
         warmup_steps=100,
         lr_scheduler_type="linear",
-        logging_dir=f"{results_dir}/logs",
-        use_cuda=torch.cuda.is_available(),
         fp16=True,
         gradient_checkpointing=True,
         max_grad_norm=1.0,
