@@ -13,3 +13,5 @@ __pycache__/
 *.pyc
 
 finetuning/qwen-finetune-env
+
+finetuning/qwen-finetune-final
