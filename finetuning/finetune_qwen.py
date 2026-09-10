@@ -1,447 +1,1143 @@
 #!/usr/bin/env python3
 """
-Fine-tune Qwen2.5 14B with FIXED training stability for test script generation
-Critical fixes applied:
-1. Response-only label masking (-100 on prompt tokens)
-2. AMD ROCm non-reentrant gradient checkpointing fix (use_reentrant=False)
-3. Sequence length locked to 1024 to prevent output truncation
-4. Clean dataset processing avoiding text column collisions
+Stable LoRA fine-tuning of Qwen2.5-14B-Instruct on LUMI/ROCm.
+
+This script:
+1. Uses Qwen's official chat template.
+2. Uses response-only loss masking (-100 on prompt tokens).
+3. Uses BF16 on one allocated LUMI GPU/GCD.
+4. Uses non-reentrant gradient checkpointing.
+5. Performs a one-batch forward/backward numerical stability test
+   before starting the real training.
+6. Trains only LoRA adapters.
+7. Evaluates validation loss during training.
+8. Saves the best LoRA adapter.
+9. Leaves BLEU/ROUGE/code-generation evaluation to evaluate_qwen.py.
 """
 
 import json
-import os
-import torch
-import numpy as np
-from pathlib import Path
+import math
+import random
 from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import torch
 from datasets import load_dataset
+from peft import LoraConfig, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    TrainingArguments,
-    Trainer,
     DataCollatorForSeq2Seq,
     EarlyStoppingCallback,
+    Trainer,
+    TrainingArguments,
+    set_seed,
 )
-from peft import LoraConfig, get_peft_model
 
-# Import metric libraries
-from rouge_score import rouge_scorer
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-import nltk
-
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
 
 # ============================================================================
-# CONFIGURATION
+# PATHS
 # ============================================================================
 
-MODEL_NAME = "Qwen/Qwen2.5-14B"
+PROJECT_DIR = Path(
+    "/project/project_465003167/m10-testbot/finetuning"
+)
+
+TRAIN_FILE = PROJECT_DIR / "dataset" / "training_data.jsonl"
+VALIDATION_FILE = PROJECT_DIR / "dataset" / "validation_data.jsonl"
+
+# Fallback if training/validation files do not exist.
+ALL_DATA_FILE = PROJECT_DIR / "dataset" / "all_data.jsonl"
+
+OUTPUT_DIR = PROJECT_DIR / "qwen-finetuned"
+
+FINAL_ADAPTER_DIR = PROJECT_DIR / "qwen-finetuned-final"
+
+RESULTS_DIR = PROJECT_DIR / "training_results"
+
+
+# ============================================================================
+# MODEL / TRAINING CONFIGURATION
+# ============================================================================
+
+MODEL_NAME = "Qwen/Qwen2.5-14B-Instruct"
+
+# LoRA
 LORA_RANK = 16
 LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
 
-LEARNING_RATE = 5e-5       # Adjusted for stable Qwen 14B LoRA fine-tuning
-BATCH_SIZE = 2             # Device batch size
-GRADIENT_ACCUMULATION = 4  # Effective batch size = 8
-WARMUP_STEPS = 50          # Scaled for dataset size
-NUM_EPOCHS = 5
-MAX_SEQ_LENGTH = 1024      # Prevents output truncation during training
-GRADIENT_CHECKPOINTING = True
-MAX_GRAD_NORM = 0.3        # Prevents exploding gradients on AMD ROCm
-WEIGHT_DECAY = 0.01
+# Training
+LEARNING_RATE = 1e-5
+
+BATCH_SIZE = 1
+GRADIENT_ACCUMULATION = 8
+
+NUM_EPOCHS = 3
+
+MAX_SEQ_LENGTH = 2048
+
+MAX_GRAD_NORM = 1.0
+
+WEIGHT_DECAY = 0.0
+
 LR_SCHEDULER = "cosine"
 
-# Global tokenizer instance for dataset mapping
+WARMUP_RATIO = 0.10
+
+SEED = 42
+
+
+# ============================================================================
+# GLOBAL
+# ============================================================================
+
 tokenizer = None
 
 
 # ============================================================================
-# DATASET TOKENIZATION WITH RESPONSE-ONLY MASKING
+# PRINTING
 # ============================================================================
+
+def print_header(title: str) -> None:
+    print("\n" + "=" * 80)
+    print(title)
+    print("=" * 80)
+
+
+# ============================================================================
+# ENVIRONMENT CHECK
+# ============================================================================
+
+def check_environment() -> None:
+
+    print_header("ENVIRONMENT CHECK")
+
+    print(f"PyTorch: {torch.__version__}")
+    print(f"ROCm/HIP: {torch.version.hip}")
+    print(f"CUDA API available: {torch.cuda.is_available()}")
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "No GPU detected. This script must run inside a LUMI GPU job."
+        )
+
+    print(f"GPU count: {torch.cuda.device_count()}")
+
+    print(f"GPU 0: {torch.cuda.get_device_name(0)}")
+
+    props = torch.cuda.get_device_properties(0)
+
+    print(
+        f"GPU memory: "
+        f"{props.total_memory / 1024**3:.2f} GiB"
+    )
+
+    if hasattr(torch.cuda, "is_bf16_supported"):
+
+        bf16_supported = torch.cuda.is_bf16_supported()
+
+        print(f"BF16 supported: {bf16_supported}")
+
+        if not bf16_supported:
+            raise RuntimeError(
+                "BF16 is not supported by the allocated GPU."
+            )
+
+    print("✓ GPU/BF16 environment check passed")
+
+
+# ============================================================================
+# DATASET HELPERS
+# ============================================================================
+
+def build_user_content(
+    instruction: str,
+    input_text: str,
+) -> str:
+
+    instruction = str(instruction or "").strip()
+
+    input_text = str(input_text or "").strip()
+
+    if input_text:
+
+        return (
+            f"{instruction}\n\n"
+            f"{input_text}"
+        )
+
+    return instruction
+
+
+def tokenize_single_example(
+    instruction: str,
+    input_text: str,
+    output: str,
+):
+    """
+    Converts one dataset example into:
+      input_ids
+      attention_mask
+      labels
+
+    Only assistant/target tokens contribute to the loss.
+    """
+
+    user_content = build_user_content(
+        instruction,
+        input_text,
+    )
+
+    output = str(output or "").strip()
+
+    if not output:
+        raise ValueError(
+            "Dataset example contains an empty output."
+        )
+
+    # User-only conversation.
+    user_messages = [
+        {
+            "role": "user",
+            "content": user_content,
+        }
+    ]
+
+    # Full supervised conversation.
+    full_messages = [
+        {
+            "role": "user",
+            "content": user_content,
+        },
+        {
+            "role": "assistant",
+            "content": output,
+        }
+    ]
+
+    # Qwen prompt including the assistant-generation marker.
+    prompt_text = tokenizer.apply_chat_template(
+        user_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    # Complete user + assistant conversation.
+    full_text = tokenizer.apply_chat_template(
+        full_messages,
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+
+    prompt_ids = tokenizer(
+        prompt_text,
+        add_special_tokens=False,
+    )["input_ids"]
+
+    full_ids = tokenizer(
+        full_text,
+        add_special_tokens=False,
+    )["input_ids"]
+
+    if len(full_ids) > MAX_SEQ_LENGTH:
+
+        raise ValueError(
+            f"Example contains {len(full_ids)} tokens, "
+            f"which exceeds MAX_SEQ_LENGTH={MAX_SEQ_LENGTH}."
+        )
+
+    response_token_count = (
+        len(full_ids) - len(prompt_ids)
+    )
+
+    if response_token_count <= 0:
+
+        raise ValueError(
+            "Example contains no trainable assistant tokens."
+        )
+
+    # Ignore prompt tokens when calculating causal-LM loss.
+    labels = (
+        [-100] * len(prompt_ids)
+        + full_ids[len(prompt_ids):]
+    )
+
+    return {
+        "input_ids": full_ids,
+        "attention_mask": [1] * len(full_ids),
+        "labels": labels,
+    }
+
 
 def format_and_tokenize(examples):
-    """Formats instruction + input into prompt, and masks prompt with -100 in labels."""
-    model_inputs = {"input_ids": [], "attention_mask": [], "labels": []}
-    
-    for instruction, input_text, output in zip(examples["instruction"], examples["input"], examples["output"]):
-        prompt = f"[INST] {instruction}\n\n{input_text} [/INST]\n"
-        response = f"{output}"
 
-        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
-        response_ids = tokenizer.encode(response, add_special_tokens=False) + [tokenizer.eos_token_id]
+    result = {
+        "input_ids": [],
+        "attention_mask": [],
+        "labels": [],
+    }
 
-        input_ids = prompt_ids + response_ids
-        
-        # Mask prompt tokens (-100) so loss is computed ONLY on target output code
-        labels = [-100] * len(prompt_ids) + response_ids
+    for instruction, input_text, output in zip(
+        examples["instruction"],
+        examples["input"],
+        examples["output"],
+    ):
 
-        # Truncate if total length exceeds MAX_SEQ_LENGTH
-        if len(input_ids) > MAX_SEQ_LENGTH:
-            input_ids = input_ids[:MAX_SEQ_LENGTH]
-            labels = labels[:MAX_SEQ_LENGTH]
+        item = tokenize_single_example(
+            instruction,
+            input_text,
+            output,
+        )
 
-        attention_mask = [1] * len(input_ids)
+        result["input_ids"].append(
+            item["input_ids"]
+        )
 
-        model_inputs["input_ids"].append(input_ids)
-        model_inputs["attention_mask"].append(attention_mask)
-        model_inputs["labels"].append(labels)
+        result["attention_mask"].append(
+            item["attention_mask"]
+        )
 
-    return model_inputs
+        result["labels"].append(
+            item["labels"]
+        )
+
+    return result
 
 
-# ============================================================================
-# METRIC CALCULATION FUNCTIONS
-# ============================================================================
+def validate_raw_dataset(
+    dataset,
+    dataset_name: str,
+) -> None:
 
-def calculate_bleu(reference, candidate):
-    """Calculate BLEU score (0-100)"""
-    if not reference or not candidate:
-        return 0.0
-    
-    ref_tokens = reference.split()
-    cand_tokens = candidate.split()
-    
-    if not ref_tokens or not cand_tokens:
-        return 0.0
-    
-    smoothing = SmoothingFunction().method1
-    
-    bleu = sentence_bleu(
-        [ref_tokens],
-        cand_tokens,
-        weights=(0.25, 0.25, 0.25, 0.25),
-        smoothing_function=smoothing
+    required_columns = {
+        "instruction",
+        "input",
+        "output",
+    }
+
+    missing = (
+        required_columns
+        - set(dataset.column_names)
     )
-    return bleu * 100.0
+
+    if missing:
+
+        raise ValueError(
+            f"{dataset_name} is missing columns: "
+            f"{sorted(missing)}"
+        )
+
+    empty_outputs = 0
+
+    for output in dataset["output"]:
+
+        if not str(output or "").strip():
+            empty_outputs += 1
+
+    if empty_outputs > 0:
+
+        raise ValueError(
+            f"{dataset_name} contains "
+            f"{empty_outputs} empty outputs."
+        )
+
+    print(
+        f"✓ {dataset_name}: "
+        f"{len(dataset)} examples"
+    )
+
+    print(
+        f"✓ Required columns present"
+    )
+
+    print(
+        f"✓ Empty outputs: {empty_outputs}"
+    )
 
 
-def calculate_rouge(reference, candidate):
-    """Calculate ROUGE-L score (0-100)"""
-    if not reference or not candidate:
-        return 0.0
-    
-    try:
-        scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=False)
-        scores = scorer.score(reference, candidate)
-        return scores['rougeL'].fmeasure * 100.0
-    except Exception:
-        return 0.0
+def load_datasets():
+
+    if (
+        TRAIN_FILE.exists()
+        and VALIDATION_FILE.exists()
+    ):
+
+        print(
+            "Using existing train/validation split."
+        )
+
+        train_dataset = load_dataset(
+            "json",
+            data_files=str(TRAIN_FILE),
+        )["train"]
+
+        validation_dataset = load_dataset(
+            "json",
+            data_files=str(VALIDATION_FILE),
+        )["train"]
+
+        return (
+            train_dataset,
+            validation_dataset,
+        )
+
+    if not ALL_DATA_FILE.exists():
+
+        raise FileNotFoundError(
+            "Could not find:\n"
+            f"  {TRAIN_FILE}\n"
+            f"  {VALIDATION_FILE}\n"
+            f"or fallback:\n"
+            f"  {ALL_DATA_FILE}"
+        )
+
+    print(
+        "Training/validation files not found."
+    )
+
+    print(
+        f"Creating deterministic 80/20 split from:"
+        f"\n  {ALL_DATA_FILE}"
+    )
+
+    full_dataset = load_dataset(
+        "json",
+        data_files=str(ALL_DATA_FILE),
+    )["train"]
+
+    split = full_dataset.train_test_split(
+        test_size=0.20,
+        seed=SEED,
+    )
+
+    train_dataset = split["train"]
+
+    validation_dataset = split["test"]
+
+    print(
+        f"Training examples:   {len(train_dataset)}"
+    )
+
+    print(
+        f"Validation examples: {len(validation_dataset)}"
+    )
+
+    return (
+        train_dataset,
+        validation_dataset,
+    )
 
 
-def calculate_exact_match(reference, candidate):
-    """Calculate Exact Match (0 or 100)"""
-    return 100.0 if reference.strip() == candidate.strip() else 0.0
+def tokenize_dataset(
+    raw_dataset,
+    dataset_name: str,
+):
 
+    print(
+        f"\nTokenizing {dataset_name}..."
+    )
 
-def calculate_token_accuracy(reference, candidate):
-    """Calculate Token Accuracy (0-100)"""
-    ref_tokens = reference.split()
-    cand_tokens = candidate.split()
-    
-    if not ref_tokens:
-        return 0.0
-    
-    min_len = min(len(ref_tokens), len(cand_tokens))
-    if min_len == 0:
-        return 0.0
-    
-    matches = sum(1 for i in range(min_len) if ref_tokens[i] == cand_tokens[i])
-    return (matches / len(ref_tokens)) * 100.0
+    tokenized_dataset = raw_dataset.map(
+        format_and_tokenize,
+        batched=True,
+        remove_columns=raw_dataset.column_names,
+        desc=f"Tokenizing {dataset_name}",
+    )
+
+    sequence_lengths = []
+
+    bad_indices = []
+
+    for i, labels in enumerate(
+        tokenized_dataset["labels"]
+    ):
+
+        trainable_tokens = sum(
+            1
+            for token in labels
+            if token != -100
+        )
+
+        if trainable_tokens <= 0:
+            bad_indices.append(i)
+
+        sequence_lengths.append(
+            len(labels)
+        )
+
+    if bad_indices:
+
+        raise RuntimeError(
+            f"{dataset_name} contains examples "
+            f"with no trainable labels: "
+            f"{bad_indices[:10]}"
+        )
+
+    print(
+        f"✓ {dataset_name} tokenized"
+    )
+
+    print(
+        f"  min length:  {min(sequence_lengths)}"
+    )
+
+    print(
+        f"  max length:  {max(sequence_lengths)}"
+    )
+
+    print(
+        f"  mean length: {np.mean(sequence_lengths):.2f}"
+    )
+
+    return tokenized_dataset
 
 
 # ============================================================================
-# CUSTOM TRAINER FOR EVALUATION
+# NUMERICAL STABILITY TEST
 # ============================================================================
 
-class CustomTrainer(Trainer):
-    """Trainer with custom evaluation metrics during validation steps"""
-    
-    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-        results = super().evaluate(eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
-        
-        target_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-        if target_dataset is not None and hasattr(self, "raw_validation_dataset"):
-            print("\nComputing BLEU/ROUGE metrics on validation sample...")
-            custom_metrics = self.compute_custom_metrics(self.raw_validation_dataset)
-            results.update(custom_metrics)
-        
-        return results
-    
-    def compute_custom_metrics(self, raw_eval_dataset, num_samples=10):
-        metrics = {
-            'eval_bleu': [],
-            'eval_rouge': [],
-            'eval_exact_match': [],
-            'eval_token_accuracy': [],
-        }
-        
-        sample_size = min(num_samples, len(raw_eval_dataset))
-        sample_indices = np.random.choice(len(raw_eval_dataset), sample_size, replace=False)
-        
-        self.model.eval()
-        device = self.model.device
-        
-        for idx in sample_indices:
-            try:
-                example = raw_eval_dataset[int(idx)]
-                reference = example.get('output', '')
-                if not reference:
-                    continue
-                
-                instruction = example.get('instruction', '')
-                input_text = example.get('input', '')
-                prompt = f"[INST] {instruction}\n\n{input_text} [/INST]\n"
-                
-                inputs = self.tokenizer(prompt, return_tensors='pt').to(device)
-                
-                with torch.no_grad():
-                    outputs = self.model.generate(
-                        **inputs,
-                        max_new_tokens=500,
-                        temperature=0.2,
-                        top_p=0.9,
-                        do_sample=False,
-                    )
-                
-                generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                
-                if '[/INST]\n' in generated_text:
-                    candidate = generated_text.split('[/INST]\n')[1].strip()
-                else:
-                    candidate = generated_text.strip()
-                
-                metrics['eval_bleu'].append(calculate_bleu(reference, candidate))
-                metrics['eval_rouge'].append(calculate_rouge(reference, candidate))
-                metrics['eval_exact_match'].append(calculate_exact_match(reference, candidate))
-                metrics['eval_token_accuracy'].append(calculate_token_accuracy(reference, candidate))
-                
-            except Exception as e:
-                print(f"  Warning: Error evaluating example {idx}: {e}")
-                continue
-        
-        return {
-            'eval_bleu_custom': np.mean(metrics['eval_bleu']) if metrics['eval_bleu'] else 0.0,
-            'eval_rouge_custom': np.mean(metrics['eval_rouge']) if metrics['eval_rouge'] else 0.0,
-            'eval_exact_match_custom': np.mean(metrics['eval_exact_match']) if metrics['eval_exact_match'] else 0.0,
-            'eval_token_accuracy_custom': np.mean(metrics['eval_token_accuracy']) if metrics['eval_token_accuracy'] else 0.0,
-        }
+def run_stability_test(
+    model,
+    data_collator,
+    tokenized_train,
+):
+
+    print_header(
+        "ONE-BATCH NUMERICAL STABILITY TEST"
+    )
+
+    # Take the first training sample.
+    example = tokenized_train[0]
+
+    batch = data_collator(
+        [example]
+    )
+
+    # Move tensors to LUMI GPU.
+    batch = {
+        key: value.to("cuda")
+        for key, value in batch.items()
+    }
+
+    model.train()
+
+    # Make sure no gradients from previous operations remain.
+    model.zero_grad(
+        set_to_none=True
+    )
+
+    print("Running forward pass...")
+
+    outputs = model(
+        **batch
+    )
+
+    loss = outputs.loss
+
+    print(
+        f"Initial loss: {loss.item():.8f}"
+    )
+
+    print(
+        f"Loss finite: "
+        f"{torch.isfinite(loss).item()}"
+    )
+
+    if not torch.isfinite(loss):
+
+        raise RuntimeError(
+            "INITIAL LOSS IS NaN/Inf.\n"
+            "Training stopped before Trainer.train()."
+        )
+
+    print("Running backward pass...")
+
+    loss.backward()
+
+    bad_gradients = []
+
+    checked = 0
+
+    for name, parameter in model.named_parameters():
+
+        if not parameter.requires_grad:
+            continue
+
+        if parameter.grad is None:
+            continue
+
+        checked += 1
+
+        if not torch.isfinite(
+            parameter.grad
+        ).all():
+
+            bad_gradients.append(name)
+
+    print(
+        f"Gradient tensors checked: {checked}"
+    )
+
+    if bad_gradients:
+
+        print(
+            "\nNaN/Inf gradients detected:"
+        )
+
+        for name in bad_gradients[:20]:
+            print(f"  {name}")
+
+        raise RuntimeError(
+            "NaN/Inf gradient detected "
+            "during the first backward pass."
+        )
+
+    # IMPORTANT:
+    # Do not leave these gradients before Trainer.train().
+    model.zero_grad(
+        set_to_none=True
+    )
+
+    torch.cuda.empty_cache()
+
+    print(
+        "✓ Forward loss is finite"
+    )
+
+    print(
+        "✓ Backward gradients are finite"
+    )
+
+    print(
+        "✓ Numerical stability test passed"
+    )
 
 
 # ============================================================================
-# MAIN TRAINING FUNCTION
+# MAIN
 # ============================================================================
 
 def main():
+
     global tokenizer
 
-    print("=" * 80)
-    print("QWEN 2.5 14B FINE-TUNING (AMD ROCm STABLE VERSION)")
-    print("=" * 80)
-    
-    print(f"\nGPU Available: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    
-    # [1/6] Load Tokenizer & Model
-    print("\n[1/6] Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token
-    print("✓ Tokenizer loaded")
-    
-    print("\n[2/6] Loading model...")
+    print_header(
+        "QWEN2.5-14B-INSTRUCT LoRA FINE-TUNING"
+    )
+
+    print(
+        "LUMI / AMD ROCm"
+    )
+
+    print(
+        f"Model: {MODEL_NAME}"
+    )
+
+    # Reproducibility.
+    set_seed(SEED)
+
+    random.seed(SEED)
+
+    np.random.seed(SEED)
+
+    # ------------------------------------------------------------------------
+    # 1. Environment
+    # ------------------------------------------------------------------------
+
+    print_header(
+        "[1/6] ENVIRONMENT"
+    )
+
+    check_environment()
+
+    # ------------------------------------------------------------------------
+    # 2. Tokenizer
+    # ------------------------------------------------------------------------
+
+    print_header(
+        "[2/6] TOKENIZER"
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME,
+        trust_remote_code=True,
+    )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    tokenizer.padding_side = "right"
+
+    print(
+        f"Pad token: {tokenizer.pad_token!r}"
+    )
+
+    print(
+        f"EOS token: {tokenizer.eos_token!r}"
+    )
+
+    print(
+        "✓ Tokenizer loaded"
+    )
+
+    # ------------------------------------------------------------------------
+    # 3. Model
+    # ------------------------------------------------------------------------
+
+    print_header(
+        "[3/6] MODEL"
+    )
+
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         torch_dtype=torch.bfloat16,
-        device_map="auto",
+        low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
-    print("✓ Model loaded")
-    
-    # [3/6] Setup LoRA
-    print("\n[3/6] Setting up LoRA...")
+
+    # One allocated GCD is one visible HIP/CUDA device.
+    #
+    # DO NOT use device_map="auto" here.
+    model = model.to("cuda")
+
+    # Disable KV-cache while training.
+    model.config.use_cache = False
+
+    # Needed when using gradient checkpointing with frozen embeddings.
+    model.enable_input_require_grads()
+
+    print(
+        "✓ Model loaded on cuda:0"
+    )
+
+    # ------------------------------------------------------------------------
+    # 4. LoRA
+    # ------------------------------------------------------------------------
+
+    print_header(
+        "[4/6] LoRA"
+    )
+
     lora_config = LoraConfig(
         r=LORA_RANK,
+
         lora_alpha=LORA_ALPHA,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+        ],
+
         lora_dropout=LORA_DROPOUT,
+
         bias="none",
+
         task_type="CAUSAL_LM",
     )
-    model = get_peft_model(model, lora_config)
+
+    model = get_peft_model(
+        model,
+        lora_config,
+    )
+
     model.print_trainable_parameters()
-    
-    # [4/6] Load and Tokenize Datasets
-    print("\n[4/6] Processing training and validation datasets...")
-    
-    raw_training = load_dataset("json", data_files="dataset/training_data.jsonl")["train"]
-    training_dataset = raw_training.map(
-        format_and_tokenize,
-        batched=True,
-        remove_columns=raw_training.column_names,
+
+    # ------------------------------------------------------------------------
+    # 5. Dataset
+    # ------------------------------------------------------------------------
+
+    print_header(
+        "[5/6] DATASET"
     )
-    
-    raw_validation = None
-    validation_dataset = None
-    if Path("dataset/validation_data.jsonl").exists():
-        raw_validation = load_dataset("json", data_files="dataset/validation_data.jsonl")["train"]
-        validation_dataset = raw_validation.map(
-            format_and_tokenize,
-            batched=True,
-            remove_columns=raw_validation.column_names,
-        )
-        print(f"✓ Validation data loaded ({len(validation_dataset)} examples)")
-    
-    print(f"✓ Training data loaded ({len(training_dataset)} examples)")
-    
-    # [5/6] Training Arguments & Setup
-    print("\n[5/6] Setting up training arguments...")
-    results_dir = "/project/project_465003167/m10-testbot/finetuning/training_results"
-    os.makedirs(results_dir, exist_ok=True)
-    
+
+    raw_train, raw_validation = load_datasets()
+
+    validate_raw_dataset(
+        raw_train,
+        "Training dataset",
+    )
+
+    validate_raw_dataset(
+        raw_validation,
+        "Validation dataset",
+    )
+
+    train_dataset = tokenize_dataset(
+        raw_train,
+        "Training dataset",
+    )
+
+    validation_dataset = tokenize_dataset(
+        raw_validation,
+        "Validation dataset",
+    )
+
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        label_pad_token_id=-100,
+        pad_to_multiple_of=8,
+        return_tensors="pt",
+    )
+
+    # ------------------------------------------------------------------------
+    # 6. Trainer
+    # ------------------------------------------------------------------------
+
+    print_header(
+        "[6/6] TRAINER"
+    )
+
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    RESULTS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
     training_args = TrainingArguments(
-        output_dir="/project/project_465003167/m10-testbot/finetuning/qwen-finetuned",
+
+        output_dir=str(
+            OUTPUT_DIR
+        ),
+
         num_train_epochs=NUM_EPOCHS,
+
         per_device_train_batch_size=BATCH_SIZE,
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION,
-        save_steps=50,
-        save_total_limit=3,
-        eval_steps=50,
-        logging_steps=5,
+
+        per_device_eval_batch_size=1,
+
+        gradient_accumulation_steps=(
+            GRADIENT_ACCUMULATION
+        ),
+
         learning_rate=LEARNING_RATE,
+
         weight_decay=WEIGHT_DECAY,
-        warmup_steps=WARMUP_STEPS,
+
+        warmup_ratio=WARMUP_RATIO,
+
         lr_scheduler_type=LR_SCHEDULER,
+
         bf16=True,
+
         fp16=False,
-        gradient_checkpointing=GRADIENT_CHECKPOINTING,
-        gradient_checkpointing_kwargs={"use_reentrant": False},  # Fixes NaN gradients on AMD ROCm
+
+        gradient_checkpointing=True,
+
+        gradient_checkpointing_kwargs={
+            "use_reentrant": False,
+        },
+
         max_grad_norm=MAX_GRAD_NORM,
-        report_to=["tensorboard"],
-        eval_strategy="steps" if validation_dataset else "no",
-        save_strategy="steps",
-        load_best_model_at_end=True if validation_dataset else False,
+
+        logging_strategy="steps",
+
+        logging_steps=1,
+
+        logging_first_step=True,
+
+        # IMPORTANT:
+        # Do not hide NaN/Inf losses.
+        logging_nan_inf_filter=False,
+
+        eval_strategy="epoch",
+
+        save_strategy="epoch",
+
+        save_total_limit=2,
+
+        load_best_model_at_end=True,
+
         metric_for_best_model="eval_loss",
+
         greater_is_better=False,
+
         optim="adamw_torch",
-        seed=42,
+
+        report_to=["tensorboard"],
+
+        seed=SEED,
+
+        data_seed=SEED,
+
+        dataloader_num_workers=2,
+
+        remove_unused_columns=False,
+
+        save_safetensors=True,
     )
-    
-    early_stopping = EarlyStoppingCallback(
-        early_stopping_patience=3,
-        early_stopping_threshold=0.01,
-    )
-    
-    trainer = CustomTrainer(
+
+    trainer = Trainer(
+
         model=model,
+
         args=training_args,
-        train_dataset=training_dataset,
+
+        train_dataset=train_dataset,
+
         eval_dataset=validation_dataset,
-        data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, pad_to_multiple_of=8),
-        callbacks=[early_stopping] if validation_dataset else [],
+
+        data_collator=data_collator,
+
+        callbacks=[
+            EarlyStoppingCallback(
+                early_stopping_patience=2,
+                early_stopping_threshold=0.0,
+            )
+        ],
     )
-    
-    trainer.tokenizer = tokenizer
-    trainer.raw_validation_dataset = raw_validation
-    
-    # [6/6] Train Model
-    print("\n[6/6] Starting training...")
-    print(f"  Effective batch size: {BATCH_SIZE * GRADIENT_ACCUMULATION}")
-    print(f"  Learning rate: {LEARNING_RATE}")
-    print(f"  Max grad norm: {MAX_GRAD_NORM}")
-    print(f"  Max seq length: {MAX_SEQ_LENGTH}")
-    
-    trainer.train()
-    
-    # Save Model and Report
-    print("\n" + "=" * 80)
-    print("SAVING MODEL AND GENERATING REPORT")
-    print("=" * 80)
-    
-    final_model_dir = "/project/project_465003167/m10-testbot/finetuning/qwen-finetuned-final"
-    os.makedirs(final_model_dir, exist_ok=True)
-    model.save_pretrained(final_model_dir)
-    tokenizer.save_pretrained(final_model_dir)
-    print(f"✓ Model saved to: {final_model_dir}")
-    
-    results = {
-        "timestamp": datetime.now().isoformat(),
+
+    print(
+        f"\nEffective batch size: "
+        f"{BATCH_SIZE * GRADIENT_ACCUMULATION}"
+    )
+
+    print(
+        f"Learning rate: {LEARNING_RATE}"
+    )
+
+    print(
+        f"Max grad norm: {MAX_GRAD_NORM}"
+    )
+
+    print(
+        f"Max sequence length: {MAX_SEQ_LENGTH}"
+    )
+
+    print(
+        f"Epochs: {NUM_EPOCHS}"
+    )
+
+    # ------------------------------------------------------------------------
+    # Stability test BEFORE real training.
+    # ------------------------------------------------------------------------
+
+    run_stability_test(
+        model=model,
+        data_collator=data_collator,
+        tokenized_train=train_dataset,
+    )
+
+    # ------------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------------
+
+    print_header(
+        "STARTING TRAINING"
+    )
+
+    train_result = trainer.train()
+
+    training_loss = float(
+        train_result.training_loss
+    )
+
+    print(
+        f"\nTraining loss: {training_loss:.8f}"
+    )
+
+    if not math.isfinite(
+        training_loss
+    ):
+
+        raise RuntimeError(
+            f"Training ended with non-finite loss: "
+            f"{training_loss}"
+        )
+
+    # ------------------------------------------------------------------------
+    # Save BEST adapter
+    # ------------------------------------------------------------------------
+
+    print_header(
+        "SAVING BEST LoRA ADAPTER"
+    )
+
+    FINAL_ADAPTER_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # Because load_best_model_at_end=True,
+    # Trainer has restored the best checkpoint.
+    trainer.save_model(
+        str(FINAL_ADAPTER_DIR)
+    )
+
+    tokenizer.save_pretrained(
+        str(FINAL_ADAPTER_DIR)
+    )
+
+    print(
+        f"✓ LoRA adapter saved to:\n"
+        f"  {FINAL_ADAPTER_DIR}"
+    )
+
+    # ------------------------------------------------------------------------
+    # Final validation loss
+    # ------------------------------------------------------------------------
+
+    print_header(
+        "FINAL VALIDATION"
+    )
+
+    eval_metrics = trainer.evaluate()
+
+    eval_loss = eval_metrics.get(
+        "eval_loss"
+    )
+
+    if eval_loss is None:
+
+        raise RuntimeError(
+            "Trainer did not return eval_loss."
+        )
+
+    eval_loss = float(eval_loss)
+
+    if not math.isfinite(
+        eval_loss
+    ):
+
+        raise RuntimeError(
+            f"FINAL VALIDATION LOSS IS NaN/Inf: "
+            f"{eval_loss}"
+        )
+
+    perplexity = math.exp(
+        eval_loss
+    )
+
+    print(
+        f"Validation loss: {eval_loss:.8f}"
+    )
+
+    print(
+        f"Perplexity:      {perplexity:.8f}"
+    )
+
+    # ------------------------------------------------------------------------
+    # Save report
+    # ------------------------------------------------------------------------
+
+    timestamp = datetime.now().isoformat()
+
+    report = {
+        "timestamp": timestamp,
+
         "model": MODEL_NAME,
-        "epochs": NUM_EPOCHS,
-        "batch_size": BATCH_SIZE,
-        "gradient_accumulation": GRADIENT_ACCUMULATION,
-        "learning_rate": LEARNING_RATE,
-        "max_grad_norm": MAX_GRAD_NORM,
+
+        "adapter_directory": str(
+            FINAL_ADAPTER_DIR
+        ),
+
         "lora_rank": LORA_RANK,
-        "max_seq_length": MAX_SEQ_LENGTH,
-        "training_examples": len(training_dataset),
-        "validation_examples": len(validation_dataset) if validation_dataset else 0,
+
+        "lora_alpha": LORA_ALPHA,
+
+        "lora_dropout": LORA_DROPOUT,
+
+        "learning_rate": LEARNING_RATE,
+
+        "batch_size": BATCH_SIZE,
+
+        "gradient_accumulation": (
+            GRADIENT_ACCUMULATION
+        ),
+
+        "effective_batch_size": (
+            BATCH_SIZE
+            * GRADIENT_ACCUMULATION
+        ),
+
+        "epochs": NUM_EPOCHS,
+
+        "max_sequence_length": (
+            MAX_SEQ_LENGTH
+        ),
+
+        "max_grad_norm": MAX_GRAD_NORM,
+
+        "training_examples": len(
+            train_dataset
+        ),
+
+        "validation_examples": len(
+            validation_dataset
+        ),
+
+        "training_loss": training_loss,
+
+        "validation_loss": eval_loss,
+
+        "perplexity": perplexity,
+
+        "evaluation_metrics": eval_metrics,
+
+        "log_history": trainer.state.log_history,
     }
-    
-    if validation_dataset:
-        print("\nRunning final validation evaluation...")
-        eval_result = trainer.evaluate(eval_dataset=validation_dataset)
-        results["metrics"] = eval_result
-        
-        print("\nFINAL EVALUATION METRICS")
-        print("-" * 80)
-        if "eval_loss" in eval_result:
-            print(f"✓ Validation Loss: {eval_result['eval_loss']:.4f}")
-        if "eval_bleu_custom" in eval_result:
-            print(f"✓ BLEU Score:      {eval_result['eval_bleu_custom']:.2f} / 100")
-        if "eval_rouge_custom" in eval_result:
-            print(f"✓ ROUGE-L Score:   {eval_result['eval_rouge_custom']:.2f} / 100")
-        if "eval_exact_match_custom" in eval_result:
-            print(f"✓ Exact Match:     {eval_result['eval_exact_match_custom']:.2f}%")
-        if "eval_token_accuracy_custom" in eval_result:
-            print(f"✓ Token Accuracy:  {eval_result['eval_token_accuracy_custom']:.2f}%")
-    
-    metrics_file = f"{results_dir}/evaluation_metrics.json"
-    with open(metrics_file, 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    text_file = f"{results_dir}/evaluation_report.txt"
-    with open(text_file, 'w') as f:
-        f.write("=" * 80 + "\n")
-        f.write("FINE-TUNING EVALUATION REPORT (FIXED)\n")
-        f.write("=" * 80 + "\n\n")
-        
-        f.write("TRAINING CONFIGURATION\n")
-        f.write("-" * 80 + "\n")
-        f.write(f"Model:                    {results['model']}\n")
-        f.write(f"Epochs:                   {results['epochs']}\n")
-        f.write(f"Batch Size:               {results['batch_size']}\n")
-        f.write(f"Gradient Accumulation:    {results['gradient_accumulation']}\n")
-        f.write(f"Effective Batch Size:     {results['batch_size'] * results['gradient_accumulation']}\n")
-        f.write(f"Learning Rate:            {results['learning_rate']}\n")
-        f.write(f"Max Grad Norm:            {results['max_grad_norm']}\n")
-        f.write(f"LoRA Rank:                {results['lora_rank']}\n")
-        f.write(f"Max Sequence Length:      {results['max_seq_length']}\n")
-        f.write(f"Training Examples:        {results['training_examples']}\n")
-        f.write(f"Validation Examples:      {results['validation_examples']}\n")
-        f.write(f"Timestamp:                {results['timestamp']}\n\n")
-        
-        if "metrics" in results:
-            f.write("EVALUATION METRICS\n")
-            f.write("-" * 80 + "\n")
-            metrics = results["metrics"]
-            if "eval_loss" in metrics:
-                f.write(f"Validation Loss:     {metrics['eval_loss']:.4f}\n")
-            if "eval_bleu_custom" in metrics:
-                f.write(f"BLEU Score:          {metrics['eval_bleu_custom']:.2f} / 100\n")
-            if "eval_rouge_custom" in metrics:
-                f.write(f"ROUGE-L Score:       {metrics['eval_rouge_custom']:.2f} / 100\n")
-            if "eval_exact_match_custom" in metrics:
-                f.write(f"Exact Match Rate:    {metrics['eval_exact_match_custom']:.2f}%\n")
-            if "eval_token_accuracy_custom" in metrics:
-                f.write(f"Token Accuracy:      {metrics['eval_token_accuracy_custom']:.2f}%\n\n")
-    
-    print(f"✓ Report saved to: {text_file}")
-    print("\n✅ TRAINING COMPLETE")
+
+    metrics_file = (
+        RESULTS_DIR
+        / "final_training_evaluation.json"
+    )
+
+    with metrics_file.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        json.dump(
+            report,
+            file,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    print(
+        f"✓ Report saved to:\n"
+        f"  {metrics_file}"
+    )
+
+    # ------------------------------------------------------------------------
+    # Complete
+    # ------------------------------------------------------------------------
+
+    print_header(
+        "TRAINING COMPLETE"
+    )
+
+    print(
+        "✓ Stability test passed"
+    )
+
+    print(
+        "✓ Training loss is finite"
+    )
+
+    print(
+        "✓ Validation loss is finite"
+    )
+
+    print(
+        f"✓ Adapter:\n"
+        f"  {FINAL_ADAPTER_DIR}"
+    )
+
+    print(
+        "\nNext step:"
+    )
+
+    print(
+        "Run evaluate_qwen.py separately."
+    )
 
 
 if __name__ == "__main__":
