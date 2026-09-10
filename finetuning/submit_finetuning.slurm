@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=10
 #SBATCH --gpus-per-node=1
 #SBATCH --mem=60G
-#SBATCH --time=02:00:00
+#SBATCH --time=03:00:00
 #SBATCH --output=/project/project_465003167/m10-testbot/finetuning/logs/slurm-%j.out
 #SBATCH --error=/project/project_465003167/m10-testbot/finetuning/logs/slurm-%j.err
 
