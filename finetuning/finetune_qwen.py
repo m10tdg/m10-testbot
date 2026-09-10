@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 Fine-tune Qwen2.5 14B with FIXED training stability for test script generation
-Critical fixes:
-1. Gradient clipping + stable learning rate
-2. Reduced dataset size = reduced LR
-3. Proper max_length based on actual data
-4. Early stopping + validation monitoring
-5. Proper metric computation
+Critical fixes applied:
+1. Response-only label masking (-100 on prompt tokens)
+2. AMD ROCm non-reentrant gradient checkpointing fix (use_reentrant=False)
+3. Sequence length locked to 1024 to prevent output truncation
+4. Clean dataset processing avoiding text column collisions
 """
 
 import json
@@ -15,7 +14,7 @@ import torch
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-from datasets import Dataset, load_dataset
+from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -37,7 +36,7 @@ except LookupError:
     nltk.download('punkt')
 
 # ============================================================================
-# FIXED CONFIGURATION
+# CONFIGURATION
 # ============================================================================
 
 MODEL_NAME = "Qwen/Qwen2.5-14B"
@@ -45,52 +44,57 @@ LORA_RANK = 16
 LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
 
-# ⚠️ CRITICAL FIXES:
-LEARNING_RATE = 2e-5  # REDUCED: Small dataset needs smaller LR (was 1e-4)
-BATCH_SIZE = 2        # REDUCED: Was 4, now 2 for gradient stability
-GRADIENT_ACCUMULATION = 4  # INCREASED: Maintain effective batch size = 8
-WARMUP_STEPS = 200    # MORE WARMUP: Prevents early loss spike
-NUM_EPOCHS = 5        # MORE EPOCHS: For small dataset, more passes help
-MAX_SEQ_LENGTH = 512  # REDUCED: Your data is ~400 tokens, not 1024
+LEARNING_RATE = 5e-5       # Adjusted for stable Qwen 14B LoRA fine-tuning
+BATCH_SIZE = 2             # Device batch size
+GRADIENT_ACCUMULATION = 4  # Effective batch size = 8
+WARMUP_STEPS = 50          # Scaled for dataset size
+NUM_EPOCHS = 5
+MAX_SEQ_LENGTH = 1024      # Prevents output truncation during training
 GRADIENT_CHECKPOINTING = True
-MAX_GRAD_NORM = 1.0   # ADD: Prevents gradient explosion (NaN fix)
+MAX_GRAD_NORM = 0.3        # Prevents exploding gradients on AMD ROCm
 WEIGHT_DECAY = 0.01
-LR_SCHEDULER = "cosine"  # CHANGED: Better than linear for stability
+LR_SCHEDULER = "cosine"
+
+# Global tokenizer instance for dataset mapping
+tokenizer = None
+
 
 # ============================================================================
-# ANALYSIS FUNCTION
+# DATASET TOKENIZATION WITH RESPONSE-ONLY MASKING
 # ============================================================================
 
-def analyze_dataset():
-    """Analyze your actual data to set proper hyperparameters"""
-    print("\n" + "=" * 80)
-    print("ANALYZING TRAINING DATA")
-    print("=" * 80)
+def format_and_tokenize(examples):
+    """Formats instruction + input into prompt, and masks prompt with -100 in labels."""
+    model_inputs = {"input_ids": [], "attention_mask": [], "labels": []}
     
-    training_data = load_dataset("json", data_files="dataset/training_data.jsonl")["train"]
-    
-    lengths = []
-    for example in training_data:
-        instruction = example.get('instruction', '')
-        input_text = example.get('input', '')
-        output = example.get('output', '')
+    for instruction, input_text, output in zip(examples["instruction"], examples["input"], examples["output"]):
+        prompt = f"[INST] {instruction}\n\n{input_text} [/INST]\n"
+        response = f"{output}"
+
+        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        response_ids = tokenizer.encode(response, add_special_tokens=False) + [tokenizer.eos_token_id]
+
+        input_ids = prompt_ids + response_ids
         
-        full_text = f"[INST] {instruction}\n\n{input_text} [/INST]\n{output}"
-        lengths.append(len(full_text.split()))  # Word count
-    
-    lengths = np.array(lengths)
-    print(f"\nToken statistics (approximate):")
-    print(f"  Mean:   {lengths.mean():.0f} tokens")
-    print(f"  Median: {np.median(lengths):.0f} tokens")
-    print(f"  Max:    {lengths.max():.0f} tokens")
-    print(f"  95th%:  {np.percentile(lengths, 95):.0f} tokens")
-    print(f"\n→ Recommended MAX_SEQ_LENGTH: {int(np.percentile(lengths, 95) * 1.2)}")
-    
-    return int(np.percentile(lengths, 95) * 1.2)
+        # Mask prompt tokens (-100) so loss is computed ONLY on target output code
+        labels = [-100] * len(prompt_ids) + response_ids
+
+        # Truncate if total length exceeds MAX_SEQ_LENGTH
+        if len(input_ids) > MAX_SEQ_LENGTH:
+            input_ids = input_ids[:MAX_SEQ_LENGTH]
+            labels = labels[:MAX_SEQ_LENGTH]
+
+        attention_mask = [1] * len(input_ids)
+
+        model_inputs["input_ids"].append(input_ids)
+        model_inputs["attention_mask"].append(attention_mask)
+        model_inputs["labels"].append(labels)
+
+    return model_inputs
 
 
 # ============================================================================
-# METRIC CALCULATION FUNCTIONS (FIXED)
+# METRIC CALCULATION FUNCTIONS
 # ============================================================================
 
 def calculate_bleu(reference, candidate):
@@ -112,7 +116,7 @@ def calculate_bleu(reference, candidate):
         weights=(0.25, 0.25, 0.25, 0.25),
         smoothing_function=smoothing
     )
-    return bleu * 100
+    return bleu * 100.0
 
 
 def calculate_rouge(reference, candidate):
@@ -123,9 +127,8 @@ def calculate_rouge(reference, candidate):
     try:
         scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=False)
         scores = scorer.score(reference, candidate)
-        rouge_l = scores['rougeL'].fmeasure
-        return rouge_l * 100
-    except:
+        return scores['rougeL'].fmeasure * 100.0
+    except Exception:
         return 0.0
 
 
@@ -143,14 +146,11 @@ def calculate_token_accuracy(reference, candidate):
         return 0.0
     
     min_len = min(len(ref_tokens), len(cand_tokens))
-    
     if min_len == 0:
-        return 0.0 if len(ref_tokens) > 0 else 100.0
+        return 0.0
     
     matches = sum(1 for i in range(min_len) if ref_tokens[i] == cand_tokens[i])
-    accuracy = (matches / len(ref_tokens)) * 100
-    
-    return accuracy
+    return (matches / len(ref_tokens)) * 100.0
 
 
 # ============================================================================
@@ -158,22 +158,20 @@ def calculate_token_accuracy(reference, candidate):
 # ============================================================================
 
 class CustomTrainer(Trainer):
-    """Trainer with custom evaluation metrics"""
+    """Trainer with custom evaluation metrics during validation steps"""
     
-    def evaluate(self, eval_dataset=None, **kwargs):
-        """Override to add custom metrics"""
-        results = super().evaluate(eval_dataset, **kwargs)
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        results = super().evaluate(eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
         
-        # Add custom metrics if validation dataset exists
-        if eval_dataset is not None:
-            print("\n⏳ Computing BLEU/ROUGE metrics (this takes ~2 min)...")
-            custom_metrics = self.compute_custom_metrics(eval_dataset)
+        target_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if target_dataset is not None and hasattr(self, "raw_validation_dataset"):
+            print("\nComputing BLEU/ROUGE metrics on validation sample...")
+            custom_metrics = self.compute_custom_metrics(self.raw_validation_dataset)
             results.update(custom_metrics)
         
         return results
     
-    def compute_custom_metrics(self, eval_dataset, num_samples=10):
-        """Compute BLEU, ROUGE on a sample of validation data"""
+    def compute_custom_metrics(self, raw_eval_dataset, num_samples=10):
         metrics = {
             'eval_bleu': [],
             'eval_rouge': [],
@@ -181,21 +179,19 @@ class CustomTrainer(Trainer):
             'eval_token_accuracy': [],
         }
         
-        sample_size = min(num_samples, len(eval_dataset))
-        sample_indices = np.random.choice(len(eval_dataset), sample_size, replace=False)
+        sample_size = min(num_samples, len(raw_eval_dataset))
+        sample_indices = np.random.choice(len(raw_eval_dataset), sample_size, replace=False)
         
         self.model.eval()
         device = self.model.device
         
         for idx in sample_indices:
             try:
-                example = eval_dataset[int(idx)]
-                
+                example = raw_eval_dataset[int(idx)]
                 reference = example.get('output', '')
                 if not reference:
                     continue
                 
-                # Build prompt
                 instruction = example.get('instruction', '')
                 input_text = example.get('input', '')
                 prompt = f"[INST] {instruction}\n\n{input_text} [/INST]\n"
@@ -206,30 +202,27 @@ class CustomTrainer(Trainer):
                     outputs = self.model.generate(
                         **inputs,
                         max_new_tokens=500,
-                        temperature=0.7,
+                        temperature=0.2,
                         top_p=0.9,
-                        do_sample=True,
+                        do_sample=False,
                     )
                 
                 generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
                 
-                # Extract generated part
                 if '[/INST]\n' in generated_text:
                     candidate = generated_text.split('[/INST]\n')[1].strip()
                 else:
-                    candidate = generated_text
+                    candidate = generated_text.strip()
                 
-                # Compute metrics
                 metrics['eval_bleu'].append(calculate_bleu(reference, candidate))
                 metrics['eval_rouge'].append(calculate_rouge(reference, candidate))
                 metrics['eval_exact_match'].append(calculate_exact_match(reference, candidate))
                 metrics['eval_token_accuracy'].append(calculate_token_accuracy(reference, candidate))
                 
             except Exception as e:
-                print(f"  ⚠️ Error evaluating example {idx}: {e}")
+                print(f"  Warning: Error evaluating example {idx}: {e}")
                 continue
         
-        # Average metrics
         return {
             'eval_bleu_custom': np.mean(metrics['eval_bleu']) if metrics['eval_bleu'] else 0.0,
             'eval_rouge_custom': np.mean(metrics['eval_rouge']) if metrics['eval_rouge'] else 0.0,
@@ -242,60 +235,35 @@ class CustomTrainer(Trainer):
 # MAIN TRAINING FUNCTION
 # ============================================================================
 
-def format_prompt(example):
-    """Format instruction-input-output into a single prompt"""
-    instruction = example.get('instruction', '')
-    input_text = example.get('input', '')
-    output = example.get('output', '')
-    
-    prompt = f"[INST] {instruction}\n\n{input_text} [/INST]\n{output}"
-    return {"text": prompt}
-
-
 def main():
+    global tokenizer
+
     print("=" * 80)
-    print("QWEN 2.5 14B FINE-TUNING (FIXED VERSION)")
+    print("QWEN 2.5 14B FINE-TUNING (AMD ROCm STABLE VERSION)")
     print("=" * 80)
     
-    # Check GPU
     print(f"\nGPU Available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # ========================================================================
-    # STEP 0: Analyze Data
-    # ========================================================================
-    
-    recommended_seq_length = analyze_dataset()
-    seq_length = min(512, max(256, recommended_seq_length))
-    print(f"→ Using MAX_SEQ_LENGTH = {seq_length}")
-    
-    # ========================================================================
-    # STEP 1: Load Tokenizer & Model
-    # ========================================================================
-    
-    print("\n[1/7] Loading tokenizer...")
+    # [1/6] Load Tokenizer & Model
+    print("\n[1/6] Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
-    print(f"✓ Tokenizer loaded")
+    print("✓ Tokenizer loaded")
     
-    print("\n[2/7] Loading model...")
+    print("\n[2/6] Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
     )
-    print(f"✓ Model loaded")
+    print("✓ Model loaded")
     
-    # ========================================================================
-    # STEP 2: Setup LoRA
-    # ========================================================================
-    
-    print("\n[3/7] Setting up LoRA...")
+    # [3/6] Setup LoRA
+    print("\n[3/6] Setting up LoRA...")
     lora_config = LoraConfig(
         r=LORA_RANK,
         lora_alpha=LORA_ALPHA,
@@ -307,53 +275,31 @@ def main():
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
     
-    # ========================================================================
-    # STEP 3: Load Data
-    # ========================================================================
+    # [4/6] Load and Tokenize Datasets
+    print("\n[4/6] Processing training and validation datasets...")
     
-    print("\n[4/7] Loading training and validation data...")
+    raw_training = load_dataset("json", data_files="dataset/training_data.jsonl")["train"]
+    training_dataset = raw_training.map(
+        format_and_tokenize,
+        batched=True,
+        remove_columns=raw_training.column_names,
+    )
     
-    # Training data
-    training_dataset = load_dataset("json", data_files="dataset/training_data.jsonl")["train"]
-    training_dataset = training_dataset.map(format_prompt, remove_columns=["instruction", "input", "output"])
-    
-    def tokenize_function(examples):
-        model_inputs = tokenizer(
-            examples["text"],
-            padding="max_length",
-            truncation=True,
-            max_length=seq_length,
-        )
-        labels = [list(ids) for ids in model_inputs["input_ids"]]
-        
-        for i in range(len(labels)):
-            labels[i] = [
-                token_id if token_id != tokenizer.pad_token_id else -100
-                for token_id in labels[i]
-            ]
-        
-        model_inputs["labels"] = labels
-        return model_inputs
-    
-    training_dataset = training_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
-    
-    # Validation data
+    raw_validation = None
     validation_dataset = None
-    validation_dataset_formatted = None
     if Path("dataset/validation_data.jsonl").exists():
-        validation_dataset = load_dataset("json", data_files="dataset/validation_data.jsonl")["train"]
-        validation_dataset_formatted = validation_dataset.map(format_prompt, remove_columns=["instruction", "input", "output"])
-        validation_dataset_formatted = validation_dataset_formatted.map(tokenize_function, batched=True, remove_columns=["text"])
+        raw_validation = load_dataset("json", data_files="dataset/validation_data.jsonl")["train"]
+        validation_dataset = raw_validation.map(
+            format_and_tokenize,
+            batched=True,
+            remove_columns=raw_validation.column_names,
+        )
         print(f"✓ Validation data loaded ({len(validation_dataset)} examples)")
     
     print(f"✓ Training data loaded ({len(training_dataset)} examples)")
     
-    # ========================================================================
-    # STEP 4: Training Arguments (FIXED)
-    # ========================================================================
-    
-    print("\n[5/7] Setting up training...")
-    
+    # [5/6] Training Arguments & Setup
+    print("\n[5/6] Setting up training arguments...")
     results_dir = "/project/project_465003167/m10-testbot/finetuning/training_results"
     os.makedirs(results_dir, exist_ok=True)
     
@@ -373,21 +319,17 @@ def main():
         bf16=True,
         fp16=False,
         gradient_checkpointing=GRADIENT_CHECKPOINTING,
-        max_grad_norm=MAX_GRAD_NORM,  # ← FIX: Prevents NaN gradients
+        gradient_checkpointing_kwargs={"use_reentrant": False},  # Fixes NaN gradients on AMD ROCm
+        max_grad_norm=MAX_GRAD_NORM,
         report_to=["tensorboard"],
-        eval_strategy="steps",
+        eval_strategy="steps" if validation_dataset else "no",
         save_strategy="steps",
-        load_best_model_at_end=True,
+        load_best_model_at_end=True if validation_dataset else False,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        # New additions for stability
-        optim="adamw_torch",  # Memory efficient
+        optim="adamw_torch",
         seed=42,
     )
-    
-    # ========================================================================
-    # STEP 6: Create Trainer & Train
-    # ========================================================================
     
     early_stopping = EarlyStoppingCallback(
         early_stopping_patience=3,
@@ -398,24 +340,33 @@ def main():
         model=model,
         args=training_args,
         train_dataset=training_dataset,
-        eval_dataset=validation_dataset_formatted if validation_dataset else None,
+        eval_dataset=validation_dataset,
         data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, pad_to_multiple_of=8),
-        callbacks=[early_stopping],
+        callbacks=[early_stopping] if validation_dataset else [],
     )
     
-    print("\n[6/7] Starting training...")
+    trainer.tokenizer = tokenizer
+    trainer.raw_validation_dataset = raw_validation
+    
+    # [6/6] Train Model
+    print("\n[6/6] Starting training...")
     print(f"  Effective batch size: {BATCH_SIZE * GRADIENT_ACCUMULATION}")
     print(f"  Learning rate: {LEARNING_RATE}")
     print(f"  Max grad norm: {MAX_GRAD_NORM}")
-    print(f"  Warmup steps: {WARMUP_STEPS}")
+    print(f"  Max seq length: {MAX_SEQ_LENGTH}")
     
     trainer.train()
     
-    # ========================================================================
-    # STEP 7: Final Evaluation
-    # ========================================================================
+    # Save Model and Report
+    print("\n" + "=" * 80)
+    print("SAVING MODEL AND GENERATING REPORT")
+    print("=" * 80)
     
-    print("\n[7/7] Computing final metrics...")
+    final_model_dir = "/project/project_465003167/m10-testbot/finetuning/qwen-finetuned-final"
+    os.makedirs(final_model_dir, exist_ok=True)
+    model.save_pretrained(final_model_dir)
+    tokenizer.save_pretrained(final_model_dir)
+    print(f"✓ Model saved to: {final_model_dir}")
     
     results = {
         "timestamp": datetime.now().isoformat(),
@@ -426,22 +377,20 @@ def main():
         "learning_rate": LEARNING_RATE,
         "max_grad_norm": MAX_GRAD_NORM,
         "lora_rank": LORA_RANK,
-        "max_seq_length": seq_length,
+        "max_seq_length": MAX_SEQ_LENGTH,
         "training_examples": len(training_dataset),
         "validation_examples": len(validation_dataset) if validation_dataset else 0,
     }
     
     if validation_dataset:
-        print("\nEvaluating on full validation set...")
-        eval_result = trainer.evaluate(eval_dataset=validation_dataset_formatted)
+        print("\nRunning final validation evaluation...")
+        eval_result = trainer.evaluate(eval_dataset=validation_dataset)
         results["metrics"] = eval_result
         
-        # Print nicely
-        print("\n" + "=" * 80)
-        print("FINAL EVALUATION METRICS")
-        print("=" * 80)
+        print("\nFINAL EVALUATION METRICS")
+        print("-" * 80)
         if "eval_loss" in eval_result:
-            print(f"\n✓ Validation Loss: {eval_result['eval_loss']:.4f}")
+            print(f"✓ Validation Loss: {eval_result['eval_loss']:.4f}")
         if "eval_bleu_custom" in eval_result:
             print(f"✓ BLEU Score:      {eval_result['eval_bleu_custom']:.2f} / 100")
         if "eval_rouge_custom" in eval_result:
@@ -451,27 +400,10 @@ def main():
         if "eval_token_accuracy_custom" in eval_result:
             print(f"✓ Token Accuracy:  {eval_result['eval_token_accuracy_custom']:.2f}%")
     
-    # ========================================================================
-    # SAVE RESULTS
-    # ========================================================================
-    
-    print("\n" + "=" * 80)
-    print("SAVING RESULTS")
-    print("=" * 80)
-    
-    final_model_dir = "/project/project_465003167/m10-testbot/finetuning/qwen-finetuned-final"
-    os.makedirs(final_model_dir, exist_ok=True)
-    model.save_pretrained(final_model_dir)
-    tokenizer.save_pretrained(final_model_dir)
-    print(f"\n✓ Model saved to: {final_model_dir}")
-    
-    # Save metrics as JSON
     metrics_file = f"{results_dir}/evaluation_metrics.json"
     with open(metrics_file, 'w') as f:
         json.dump(results, f, indent=2)
-    print(f"✓ Metrics saved to: {metrics_file}")
     
-    # Save readable report
     text_file = f"{results_dir}/evaluation_report.txt"
     with open(text_file, 'w') as f:
         f.write("=" * 80 + "\n")
@@ -507,22 +439,9 @@ def main():
                 f.write(f"Exact Match Rate:    {metrics['eval_exact_match_custom']:.2f}%\n")
             if "eval_token_accuracy_custom" in metrics:
                 f.write(f"Token Accuracy:      {metrics['eval_token_accuracy_custom']:.2f}%\n\n")
-            
-            f.write("INTERPRETATION\n")
-            f.write("-" * 80 + "\n")
-            f.write("Loss > 1.0:        ✓ Good (training is learning)\n")
-            f.write("BLEU > 30:         ✓ Good for code generation\n")
-            f.write("ROUGE > 40:        ✓ Good for code structure\n")
-            f.write("Exact Match > 10%: ✓ Reasonable for code gen\n")
-            f.write("Token Accuracy > 50%: ✓ Good for code gen\n")
     
     print(f"✓ Report saved to: {text_file}")
-    
-    print("\n" + "=" * 80)
-    print("✅ TRAINING COMPLETE")
-    print("=" * 80)
-    print(f"\nResults directory: {results_dir}")
-    print(f"Model directory:   {final_model_dir}")
+    print("\n✅ TRAINING COMPLETE")
 
 
 if __name__ == "__main__":
