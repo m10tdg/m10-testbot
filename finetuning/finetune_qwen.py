@@ -870,8 +870,6 @@ def main():
         dataloader_num_workers=2,
 
         remove_unused_columns=False,
-
-        save_safetensors=True,
     )
 
     trainer = Trainer(
