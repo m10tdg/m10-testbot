@@ -84,7 +84,7 @@ WEIGHT_DECAY = 0.0
 
 LR_SCHEDULER = "cosine"
 
-WARMUP_RATIO = 0.10
+WARMUP_STEPS = 0.10
 
 SEED = 42
 
@@ -821,7 +821,7 @@ def main():
 
         weight_decay=WEIGHT_DECAY,
 
-        warmup_ratio=WARMUP_RATIO,
+        warmup_steps=WARMUP_STEPS,
 
         lr_scheduler_type=LR_SCHEDULER,
 
