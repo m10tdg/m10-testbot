@@ -381,7 +381,7 @@ def main():
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         # New additions for stability
-        optim="adamw_8bit",  # Memory efficient
+        optim="adamw_torch",  # Memory efficient
         seed=42,
     )
     
