@@ -290,22 +290,36 @@ def main():
     
     # Tokenize training data
     def tokenize_function(examples):
-        model_inputs = tokenizer(
-            examples["text"],
-            padding="max_length",
-            truncation=True,
-            max_length=MAX_SEQ_LENGTH,
-        )
-        labels = [list(ids) for ids in model_inputs["input_ids"]]
+        model_inputs = {"input_ids": [], "attention_mask": [], "labels": []}
     
-        # Replace pad token IDs with -100 so loss ignores them
-        for i in range(len(labels)):
-            labels[i] = [
-                token_id if token_id != tokenizer.pad_token_id else -100
-                for token_id in labels[i]
-            ]
+        for text in examples["text"]:
+            # Separate prompt from output
+            if "[/INST]\n" in text:
+                prompt, response = text.split("[/INST]\n", 1)
+                prompt = prompt + "[/INST]\n"
+            else:
+                prompt = ""
+                response = text
+
+            prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+            response_ids = tokenizer.encode(response, add_special_tokens=False)
+
+            input_ids = prompt_ids + response_ids
         
-        model_inputs["labels"] = labels
+            # Mask prompt tokens (-100) so loss is computed ONLY on response
+            labels = [-100] * len(prompt_ids) + response_ids
+
+            # Truncate to maximum sequence length
+            if len(input_ids) > MAX_SEQ_LENGTH:
+                input_ids = input_ids[:MAX_SEQ_LENGTH]
+                labels = labels[:MAX_SEQ_LENGTH]
+
+            attention_mask = [1] * len(input_ids)
+
+            model_inputs["input_ids"].append(input_ids)
+            model_inputs["attention_mask"].append(attention_mask)
+            model_inputs["labels"].append(labels)
+
         return model_inputs
     
     training_dataset = training_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
@@ -342,18 +356,19 @@ def main():
         gradient_accumulation_steps=GRADIENT_ACCUMULATION,
         save_steps=50,
         save_total_limit=3,
-        eval_steps=50,  # Evaluate every 50 steps
+        eval_steps=50,
         logging_steps=10,
-        learning_rate=LEARNING_RATE,
+        learning_rate=5e-5,  # Reduced from 1e-4 to maintain stability
         weight_decay=0.01,
-        warmup_steps=100,
-        lr_scheduler_type="linear",
+        warmup_steps=20,     # Adjusted warmup for shorter dataset
+        lr_scheduler_type="cosine",
         bf16=True,
         fp16=False,
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False}, # Critical fix for AMD MI250X
         max_grad_norm=0.3,
         report_to=["tensorboard"],
-        eval_strategy="steps",  # Evaluate every N steps
+        eval_strategy="steps",
         save_strategy="steps",
     )
     
