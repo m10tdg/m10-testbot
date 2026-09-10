@@ -39,7 +39,7 @@ MODEL_NAME = "Qwen/Qwen2.5-14B"
 LORA_RANK = 16
 LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
-LEARNING_RATE = 2e-4
+LEARNING_RATE = 1e-4
 BATCH_SIZE = 4
 GRADIENT_ACCUMULATION = 2
 NUM_EPOCHS = 3
@@ -295,10 +295,17 @@ def main():
             padding="max_length",
             truncation=True,
             max_length=MAX_SEQ_LENGTH,
-            )
-
-        # Assign labels to match input_ids for causal language modeling
-        model_inputs["labels"] = model_inputs["input_ids"].copy()
+        )
+        labels = [list(ids) for ids in model_inputs["input_ids"]]
+    
+        # Replace pad token IDs with -100 so loss ignores them
+        for i in range(len(labels)):
+            labels[i] = [
+                token_id if token_id != tokenizer.pad_token_id else -100
+                for token_id in labels[i]
+            ]
+        
+        model_inputs["labels"] = labels
         return model_inputs
     
     training_dataset = training_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
@@ -344,7 +351,7 @@ def main():
         bf16=True,
         fp16=False,
         gradient_checkpointing=True,
-        max_grad_norm=1.0,
+        max_grad_norm=0.3,
         report_to=["tensorboard"],
         eval_strategy="steps",  # Evaluate every N steps
         save_strategy="steps",
