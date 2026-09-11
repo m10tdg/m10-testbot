@@ -13,12 +13,15 @@ VAL_FILE = PROJECT_DIR / "dataset" / "validation_data.jsonl"
 OUTPUT_FILE = PROJECT_DIR / "training_results" / "evaluation_finetuned.json"
 
 tokenizer = AutoTokenizer.from_pretrained(ADAPTER_DIR, trust_remote_code=True)
+
+# Load base model directly to CUDA (matches finetune_qwen.py pattern for LUMI/ROCm)
 model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL,
-    torch_dtype=torch.bfloat16,
-    device_map="auto",
+    dtype=torch.bfloat16,
+    low_cpu_mem_usage=True,
     trust_remote_code=True,
-)
+).to("cuda")
+
 model = PeftModel.from_pretrained(model, ADAPTER_DIR)
 model.eval()
 
