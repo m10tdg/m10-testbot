@@ -69,7 +69,7 @@ LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
 
 # Training
-LEARNING_RATE = 1e-5
+LEARNING_RATE = 5e-6
 
 BATCH_SIZE = 1
 GRADIENT_ACCUMULATION = 8
@@ -192,6 +192,21 @@ def tokenize_single_example(
 
     output = str(output or "").strip()
 
+    system_message = {
+        "role": "system",
+        "content": (
+            "You are a Playwright test automation expert. "
+            "Given a test instruction, URL, and DOM structure, "
+            "generate a concise executable Playwright Python script. "
+            "Output ONLY Python code using page.locator(), "
+            "page.fill(), page.click(), page.wait_for_url(), "
+            "and similar Playwright methods. "
+            "Use the exact selector IDs from the DOM structure. "
+            "Include try/except error handling. "
+            "No explanations, no markdown, only Python code."
+        )
+    }
+
     if not output:
         raise ValueError(
             "Dataset example contains an empty output."
@@ -199,6 +214,7 @@ def tokenize_single_example(
 
     # User-only conversation.
     user_messages = [
+        system_message,
         {
             "role": "user",
             "content": user_content,
@@ -207,6 +223,7 @@ def tokenize_single_example(
 
     # Full supervised conversation.
     full_messages = [
+        system_message,
         {
             "role": "user",
             "content": user_content,
@@ -730,6 +747,9 @@ def main():
             "k_proj",
             "v_proj",
             "o_proj",
+            "gate_proj",   # ADD THESE
+            "up_proj",     # ADD THESE
+            "down_proj",   # ADD THESE
         ],
 
         lora_dropout=LORA_DROPOUT,
