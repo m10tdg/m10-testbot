@@ -1,9 +1,9 @@
-# evaluate_qwen.py
 import json
 from pathlib import Path
 import torch
 from datasets import load_dataset
 from peft import PeftModel
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 PROJECT_DIR = Path("/project/project_465003167/m10-testbot/finetuning")
@@ -12,16 +12,20 @@ ADAPTER_DIR = PROJECT_DIR / "qwen-finetuned-final"
 VAL_FILE = PROJECT_DIR / "dataset" / "validation_data.jsonl"
 OUTPUT_FILE = PROJECT_DIR / "training_results" / "evaluation_finetuned.json"
 
+print("Loading tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(ADAPTER_DIR, trust_remote_code=True)
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token_id = tokenizer.eos_token_id
 
-# Load base model directly to CUDA (matches finetune_qwen.py pattern for LUMI/ROCm)
+print("Loading base model...")
 model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL,
-    dtype=torch.bfloat16,
+    torch_dtype=torch.bfloat16,
     low_cpu_mem_usage=True,
     trust_remote_code=True,
 ).to("cuda")
 
+print("Loading LoRA adapter...")
 model = PeftModel.from_pretrained(model, ADAPTER_DIR)
 model.eval()
 
@@ -42,40 +46,47 @@ system_message = {
     ),
 }
 
-for i, example in enumerate(dataset):
-    user_content = example["instruction"]
-    if example.get("input"):
-        user_content += f"\n\n{example['input']}"
+print(f"Starting evaluation on {len(dataset)} examples...")
 
-    messages = [system_message, {"role": "user", "content": user_content}]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+# Use inference_mode for faster inference and lower VRAM consumption
+with torch.inference_mode():
+    for i, example in enumerate(tqdm(dataset, desc="Generating evaluation predictions")):
+        user_content = example["instruction"]
+        if example.get("input"):
+            user_content += f"\n\n{example['input']}"
 
-    with torch.no_grad():
+        messages = [system_message, {"role": "user", "content": user_content}]
+        prompt = tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+        inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+
+        # Fixed generation arguments: do_sample=False (Greedy) without temperature
         outputs = model.generate(
             **inputs,
             max_new_tokens=512,
-            temperature=0.1,
             do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
 
-    # Decode only generated tokens
-    gen_tokens = outputs[0][inputs["input_ids"].shape[1] :]
-    pred_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+        gen_tokens = outputs[0][inputs["input_ids"].shape[1] :]
+        pred_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
 
-    predictions.append(
-        {
-            "index": i,
-            "instruction": example.get("instruction", ""),
-            "input": example.get("input", ""),
-            "reference": example.get("output", ""),
-            "prediction": pred_text,
-        }
-    )
+        predictions.append(
+            {
+                "index": i,
+                "instruction": example.get("instruction", ""),
+                "input": example.get("input", ""),
+                "reference": example.get("output", ""),
+                "prediction": pred_text,
+            }
+        )
 
 OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
 with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
     json.dump({"predictions": predictions}, f, indent=2)
 
-print(f"Predictions saved to {OUTPUT_FILE}")
+print(f"\nSuccessfully saved {len(predictions)} predictions to {OUTPUT_FILE}")
