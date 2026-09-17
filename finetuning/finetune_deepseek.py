@@ -1,31 +1,57 @@
 #!/usr/bin/env python3
 """
 Stable LoRA fine-tuning of DeepSeek-Coder-V2-Lite-Instruct on LUMI/ROCm.
-
-This script:
-1. Uses DeepSeek's official chat template.
-2. Uses response-only loss masking (-100 on prompt tokens).
-3. Uses BF16 on one allocated LUMI GPU/GCD.
-4. Uses non-reentrant gradient checkpointing.
-5. Performs a one-batch forward/backward numerical stability test
-   before starting the real training.
-6. Trains only LoRA adapters.
-7. Evaluates validation loss during training.
-8. Saves the best LoRA adapter.
-9. Leaves BLEU/ROUGE/code-generation evaluation to a separate evaluate script.
-
-Key differences from the Qwen script:
-- DeepSeek-Coder-V2-Lite uses a different chat template format.
-- trust_remote_code=True is REQUIRED for both model and tokenizer
-  (DeepSeek-V2 uses custom attention / MoE kernels).
-- The model has a Mixture-of-Experts (MoE) architecture; only the
-  attention projection layers and a subset of MLP layers are targeted
-  with LoRA to keep memory in bounds on a single GCD.
-- torch_dtype=torch.bfloat16 is set at load time to avoid the BF16
-  conversion spike that would occur if the model were loaded in FP32.
-- DeepSeek-V2 family tokenizers may not define a pad token by default;
-  we set it to eos_token as with Qwen.
+...
 """
+
+# ============================================================================
+# FLASH-ATTN STUB
+# DeepSeek-Coder-V2's remote modeling file unconditionally lists flash_attn
+# as a required import. Transformers' check_imports() scans for this BEFORE
+# from_pretrained() sees attn_implementation="eager", so the check fails even
+# though flash_attn is never actually called at runtime.
+# This stub satisfies the static import check without installing flash_attn.
+# ============================================================================
+
+import sys
+import types
+
+def _stub_flash_attn() -> None:
+    """Register dummy flash_attn modules so DeepSeek's import check passes."""
+
+    if "flash_attn" in sys.modules:
+        return  # already present (real or stubbed)
+
+    # Top-level package
+    fa = types.ModuleType("flash_attn")
+    fa.__version__ = "0.0.0"
+    fa.__spec__ = None
+    sys.modules["flash_attn"] = fa
+
+    # Submodules DeepSeek-V2 references
+    for submod in [
+        "flash_attn.flash_attn_interface",
+        "flash_attn.bert_padding",
+        "flash_attn.ops",
+        "flash_attn.ops.fused_dense",
+        "flash_attn.layers",
+        "flash_attn.layers.rotary",
+    ]:
+        m = types.ModuleType(submod)
+        m.__spec__ = None
+        sys.modules[submod] = m
+
+    # Commonly referenced names — set to None so any accidental call
+    # raises AttributeError rather than NameError.
+    fa.flash_attn_func = None
+    fa.flash_attn_varlen_func = None
+    fa.flash_attn_with_kvcache = None
+
+_stub_flash_attn()
+
+# ============================================================================
+# Now safe to import the rest
+# ============================================================================
 
 import json
 import math
