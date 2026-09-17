@@ -952,7 +952,7 @@ def main():
     )
 
 
-    train_result = trainer.train(resume_from_checkpoint="/project/project_465003167/m10-testbot/finetuning/qwen-finetuned/checkpoint-1392")
+    train_result = trainer.train()
 
     training_loss = float(
         train_result.training_loss
