@@ -555,6 +555,7 @@ def main():
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
+        attn_implementation="eager",
     )
 
     # One allocated GCD = one visible HIP/CUDA device.
