@@ -1,58 +1,3 @@
-#!/usr/bin/env python3
-"""
-Stable LoRA fine-tuning of DeepSeek-Coder-V2-Lite-Instruct on LUMI/ROCm.
-...
-"""
-
-# ============================================================================
-# FLASH-ATTN STUB
-# DeepSeek-Coder-V2's remote modeling file unconditionally lists flash_attn
-# as a required import. Transformers' check_imports() scans for this BEFORE
-# from_pretrained() sees attn_implementation="eager", so the check fails even
-# though flash_attn is never actually called at runtime.
-# This stub satisfies the static import check without installing flash_attn.
-# ============================================================================
-
-import sys
-import types
-
-def _stub_flash_attn() -> None:
-    """Register dummy flash_attn modules so DeepSeek's import check passes."""
-
-    if "flash_attn" in sys.modules:
-        return  # already present (real or stubbed)
-
-    # Top-level package
-    fa = types.ModuleType("flash_attn")
-    fa.__version__ = "0.0.0"
-    fa.__spec__ = None
-    sys.modules["flash_attn"] = fa
-
-    # Submodules DeepSeek-V2 references
-    for submod in [
-        "flash_attn.flash_attn_interface",
-        "flash_attn.bert_padding",
-        "flash_attn.ops",
-        "flash_attn.ops.fused_dense",
-        "flash_attn.layers",
-        "flash_attn.layers.rotary",
-    ]:
-        m = types.ModuleType(submod)
-        m.__spec__ = None
-        sys.modules[submod] = m
-
-    # Commonly referenced names — set to None so any accidental call
-    # raises AttributeError rather than NameError.
-    fa.flash_attn_func = None
-    fa.flash_attn_varlen_func = None
-    fa.flash_attn_with_kvcache = None
-
-_stub_flash_attn()
-
-# ============================================================================
-# Now safe to import the rest
-# ============================================================================
-
 import json
 import math
 import random
@@ -73,6 +18,38 @@ from transformers import (
     set_seed,
 )
 
+import transformers.dynamic_module_utils as dynamic_module_utils
+
+
+# ============================================================================
+# TRANSFORMERS 4.36.2 / DEEPSEEK FLASH-ATTN WORKAROUND
+# ============================================================================
+#
+# Transformers 4.36.2 may incorrectly detect flash_attn as a mandatory
+# dependency when loading DeepSeek remote code, even though DeepSeek imports
+# it only inside:
+#
+#     if is_flash_attn_2_available():
+#
+# We explicitly use attn_implementation="eager", so FlashAttention 2 is not
+# needed. Remove flash_attn only from DeepSeek's modeling file dependency list.
+# ============================================================================
+
+_original_get_imports = dynamic_module_utils.get_imports
+
+
+def _patched_get_imports(filename):
+    imports = _original_get_imports(filename)
+
+    filename_str = str(filename)
+
+    if filename_str.endswith("modeling_deepseek.py"):
+        imports = [imp for imp in imports if imp != "flash_attn"]
+
+    return imports
+
+
+dynamic_module_utils.get_imports = _patched_get_imports
 
 # ============================================================================
 # PATHS
