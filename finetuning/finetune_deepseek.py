@@ -1,3 +1,50 @@
+#!/usr/bin/env python3
+"""
+Stable LoRA fine-tuning of DeepSeek-Coder-V2-Lite-Instruct on LUMI/ROCm.
+
+Fixes applied vs previous version:
+- attn_implementation="eager"  (sdpa not supported by DeepseekV2ForCausalLM
+  in transformers 4.41.2; the SDPA path raises ValueError at load time)
+- get_imports patch to strip flash_attn from DeepSeek's static import list
+  (check_imports runs before from_pretrained sees attn_implementation)
+- dataloader_num_workers=0 + dataloader_prefetch_factor=None to avoid
+  tokenizer-parallelism fork warnings that stall worker processes
+- torch.backends.cuda.matmul.allow_tf32 / allow_bf16_reduced_precision_reduction
+  enabled for faster BF16 GEMMs on MI250X
+"""
+
+import sys
+import types
+
+# ============================================================================
+# FLASH-ATTN IMPORT PATCH  (must run before any transformers import)
+#
+# Transformers' check_imports() statically scans DeepSeek's modeling file
+# and raises ImportError if flash_attn is listed but not installed — this
+# happens BEFORE from_pretrained() sees attn_implementation="eager".
+#
+# We monkey-patch get_imports to strip "flash_attn" from the dependency list
+# of modeling_deepseek.py so the check passes cleanly.
+# ============================================================================
+
+import transformers.dynamic_module_utils as _dmu
+
+_orig_get_imports = _dmu.get_imports
+
+
+def _patched_get_imports(filename):
+    imports = _orig_get_imports(filename)
+    if str(filename).endswith("modeling_deepseek.py"):
+        imports = [imp for imp in imports if imp != "flash_attn"]
+    return imports
+
+
+_dmu.get_imports = _patched_get_imports
+
+# ============================================================================
+# NOW safe to import everything else
+# ============================================================================
+
 import json
 import math
 import random
@@ -18,38 +65,6 @@ from transformers import (
     set_seed,
 )
 
-import transformers.dynamic_module_utils as dynamic_module_utils
-
-
-# ============================================================================
-# TRANSFORMERS 4.36.2 / DEEPSEEK FLASH-ATTN WORKAROUND
-# ============================================================================
-#
-# Transformers 4.36.2 may incorrectly detect flash_attn as a mandatory
-# dependency when loading DeepSeek remote code, even though DeepSeek imports
-# it only inside:
-#
-#     if is_flash_attn_2_available():
-#
-# We explicitly use attn_implementation="eager", so FlashAttention 2 is not
-# needed. Remove flash_attn only from DeepSeek's modeling file dependency list.
-# ============================================================================
-
-_original_get_imports = dynamic_module_utils.get_imports
-
-
-def _patched_get_imports(filename):
-    imports = _original_get_imports(filename)
-
-    filename_str = str(filename)
-
-    if filename_str.endswith("modeling_deepseek.py"):
-        imports = [imp for imp in imports if imp != "flash_attn"]
-
-    return imports
-
-
-dynamic_module_utils.get_imports = _patched_get_imports
 
 # ============================================================================
 # PATHS
@@ -59,17 +74,13 @@ PROJECT_DIR = Path(
     "/project/project_465003167/m10-testbot/finetuning"
 )
 
-TRAIN_FILE = PROJECT_DIR / "dataset" / "training_data.jsonl"
+TRAIN_FILE      = PROJECT_DIR / "dataset" / "training_data.jsonl"
 VALIDATION_FILE = PROJECT_DIR / "dataset" / "validation_data.jsonl"
+ALL_DATA_FILE   = PROJECT_DIR / "dataset" / "all_data.jsonl"
 
-# Fallback if training/validation files do not exist.
-ALL_DATA_FILE = PROJECT_DIR / "dataset" / "all_data.jsonl"
-
-OUTPUT_DIR = PROJECT_DIR / "deepseek-finetuned"
-
+OUTPUT_DIR        = PROJECT_DIR / "deepseek-finetuned"
 FINAL_ADAPTER_DIR = PROJECT_DIR / "deepseek-finetuned-final"
-
-RESULTS_DIR = PROJECT_DIR / "training_results"
+RESULTS_DIR       = PROJECT_DIR / "training_results"
 
 
 # ============================================================================
@@ -78,32 +89,20 @@ RESULTS_DIR = PROJECT_DIR / "training_results"
 
 MODEL_NAME = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 
-# LoRA
-# DeepSeek-Coder-V2-Lite is a 16B MoE model (2.4B active params).
-# Rank 16 / alpha 32 is a safe starting point.
-LORA_RANK = 16
-LORA_ALPHA = 32
+LORA_RANK    = 16
+LORA_ALPHA   = 32
 LORA_DROPOUT = 0.05
 
-# Training
-LEARNING_RATE = 5e-6
-
-BATCH_SIZE = 1
-GRADIENT_ACCUMULATION = 8
-
-NUM_EPOCHS = 3
-
-MAX_SEQ_LENGTH = 2048
-
-MAX_GRAD_NORM = 1.0
-
-WEIGHT_DECAY = 0.0
-
-LR_SCHEDULER = "cosine"
-
-WARMUP_STEPS = 0.10
-
-SEED = 42
+LEARNING_RATE          = 5e-6
+BATCH_SIZE             = 1
+GRADIENT_ACCUMULATION  = 8
+NUM_EPOCHS             = 3
+MAX_SEQ_LENGTH         = 2048
+MAX_GRAD_NORM          = 1.0
+WEIGHT_DECAY           = 0.0
+LR_SCHEDULER           = "cosine"
+WARMUP_STEPS           = 0.10
+SEED                   = 42
 
 
 # ============================================================================
@@ -144,19 +143,24 @@ def check_environment() -> None:
     print(f"GPU 0: {torch.cuda.get_device_name(0)}")
 
     props = torch.cuda.get_device_properties(0)
-
     print(f"GPU memory: {props.total_memory / 1024**3:.2f} GiB")
 
     if hasattr(torch.cuda, "is_bf16_supported"):
-
         bf16_supported = torch.cuda.is_bf16_supported()
-
         print(f"BF16 supported: {bf16_supported}")
-
         if not bf16_supported:
-            raise RuntimeError(
-                "BF16 is not supported by the allocated GPU."
-            )
+            raise RuntimeError("BF16 is not supported by the allocated GPU.")
+
+    # -----------------------------------------------------------------------
+    # MI250X performance knobs
+    # -----------------------------------------------------------------------
+    # Allow TF32 on matrix multiplications (no-op on MI250X but harmless).
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    # Key speedup on MI250X: fused BF16 reduction in GEMM kernels.
+    if hasattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction"):
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+        print("✓ BF16 reduced-precision reduction enabled")
 
     print("✓ GPU/BF16 environment check passed")
 
@@ -165,46 +169,23 @@ def check_environment() -> None:
 # DATASET HELPERS
 # ============================================================================
 
-def build_user_content(
-    instruction: str,
-    input_text: str,
-) -> str:
-
+def build_user_content(instruction: str, input_text: str) -> str:
     instruction = str(instruction or "").strip()
-    input_text = str(input_text or "").strip()
-
+    input_text  = str(input_text  or "").strip()
     if input_text:
-        return (
-            f"{instruction}\n\n"
-            f"{input_text}"
-        )
-
+        return f"{instruction}\n\n{input_text}"
     return instruction
 
 
-def tokenize_single_example(
-    instruction: str,
-    input_text: str,
-    output: str,
-):
+def tokenize_single_example(instruction: str, input_text: str, output: str):
     """
-    Converts one dataset example into:
-      input_ids
-      attention_mask
-      labels
-
-    Only assistant/target tokens contribute to the loss.
-
-    DeepSeek-Coder-V2-Instruct chat template note:
-    The model ships a Jinja2 chat template in its tokenizer_config.json.
-    We call apply_chat_template() exactly as with Qwen; no manual
-    <|im_start|> / <|im_end|> wrangling is needed.
+    Returns input_ids / attention_mask / labels with prompt tokens masked
+    (-100) so only assistant tokens contribute to the loss.
     """
 
     user_content = build_user_content(instruction, input_text)
-    output = str(output or "").strip()
+    output       = str(output or "").strip()
 
-    # DeepSeek-Coder-V2 supports a system message role.
     system_message = {
         "role": "system",
         "content": (
@@ -223,42 +204,26 @@ def tokenize_single_example(
     if not output:
         raise ValueError("Dataset example contains an empty output.")
 
-    # User-only conversation (used to compute prompt length).
     user_messages = [
         system_message,
         {"role": "user", "content": user_content},
     ]
 
-    # Full supervised conversation.
     full_messages = [
         system_message,
         {"role": "user", "content": user_content},
         {"role": "assistant", "content": output},
     ]
 
-    # DeepSeek prompt including the assistant-generation marker.
     prompt_text = tokenizer.apply_chat_template(
-        user_messages,
-        tokenize=False,
-        add_generation_prompt=True,
+        user_messages, tokenize=False, add_generation_prompt=True
     )
-
-    # Complete user + assistant conversation.
     full_text = tokenizer.apply_chat_template(
-        full_messages,
-        tokenize=False,
-        add_generation_prompt=False,
+        full_messages, tokenize=False, add_generation_prompt=False
     )
 
-    prompt_ids = tokenizer(
-        prompt_text,
-        add_special_tokens=False,
-    )["input_ids"]
-
-    full_ids = tokenizer(
-        full_text,
-        add_special_tokens=False,
-    )["input_ids"]
+    prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+    full_ids   = tokenizer(full_text,   add_special_tokens=False)["input_ids"]
 
     if len(full_ids) > MAX_SEQ_LENGTH:
         raise ValueError(
@@ -266,68 +231,41 @@ def tokenize_single_example(
             f"which exceeds MAX_SEQ_LENGTH={MAX_SEQ_LENGTH}."
         )
 
-    response_token_count = len(full_ids) - len(prompt_ids)
+    if len(full_ids) - len(prompt_ids) <= 0:
+        raise ValueError("Example contains no trainable assistant tokens.")
 
-    if response_token_count <= 0:
-        raise ValueError(
-            "Example contains no trainable assistant tokens."
-        )
-
-    # Mask prompt tokens so only assistant tokens contribute to loss.
-    labels = (
-        [-100] * len(prompt_ids)
-        + full_ids[len(prompt_ids):]
-    )
+    labels = [-100] * len(prompt_ids) + full_ids[len(prompt_ids):]
 
     return {
-        "input_ids": full_ids,
+        "input_ids":      full_ids,
         "attention_mask": [1] * len(full_ids),
-        "labels": labels,
+        "labels":         labels,
     }
 
 
 def format_and_tokenize(examples):
-
-    result = {
-        "input_ids": [],
-        "attention_mask": [],
-        "labels": [],
-    }
-
+    result = {"input_ids": [], "attention_mask": [], "labels": []}
     for instruction, input_text, output in zip(
-        examples["instruction"],
-        examples["input"],
-        examples["output"],
+        examples["instruction"], examples["input"], examples["output"]
     ):
         item = tokenize_single_example(instruction, input_text, output)
-
         result["input_ids"].append(item["input_ids"])
         result["attention_mask"].append(item["attention_mask"])
         result["labels"].append(item["labels"])
-
     return result
 
 
 def validate_raw_dataset(dataset, dataset_name: str) -> None:
-
     required_columns = {"instruction", "input", "output"}
-
     missing = required_columns - set(dataset.column_names)
-
     if missing:
-        raise ValueError(
-            f"{dataset_name} is missing columns: {sorted(missing)}"
-        )
+        raise ValueError(f"{dataset_name} is missing columns: {sorted(missing)}")
 
     empty_outputs = sum(
-        1 for output in dataset["output"]
-        if not str(output or "").strip()
+        1 for o in dataset["output"] if not str(o or "").strip()
     )
-
     if empty_outputs > 0:
-        raise ValueError(
-            f"{dataset_name} contains {empty_outputs} empty outputs."
-        )
+        raise ValueError(f"{dataset_name} contains {empty_outputs} empty outputs.")
 
     print(f"✓ {dataset_name}: {len(dataset)} examples")
     print(f"✓ Required columns present")
@@ -335,72 +273,41 @@ def validate_raw_dataset(dataset, dataset_name: str) -> None:
 
 
 def load_datasets():
-
     if TRAIN_FILE.exists() and VALIDATION_FILE.exists():
-
         print("Using existing train/validation split.")
-
-        train_dataset = load_dataset(
-            "json", data_files=str(TRAIN_FILE)
-        )["train"]
-
-        validation_dataset = load_dataset(
-            "json", data_files=str(VALIDATION_FILE)
-        )["train"]
-
+        train_dataset = load_dataset("json", data_files=str(TRAIN_FILE))["train"]
+        validation_dataset = load_dataset("json", data_files=str(VALIDATION_FILE))["train"]
         return train_dataset, validation_dataset
 
     if not ALL_DATA_FILE.exists():
         raise FileNotFoundError(
-            "Could not find:\n"
-            f"  {TRAIN_FILE}\n"
-            f"  {VALIDATION_FILE}\n"
-            f"or fallback:\n"
-            f"  {ALL_DATA_FILE}"
+            f"Could not find:\n  {TRAIN_FILE}\n  {VALIDATION_FILE}\n"
+            f"or fallback:\n  {ALL_DATA_FILE}"
         )
 
-    print("Training/validation files not found.")
-    print(
-        f"Creating deterministic 80/20 split from:\n  {ALL_DATA_FILE}"
-    )
-
-    full_dataset = load_dataset(
-        "json", data_files=str(ALL_DATA_FILE)
-    )["train"]
-
+    print(f"Creating deterministic 80/20 split from:\n  {ALL_DATA_FILE}")
+    full_dataset = load_dataset("json", data_files=str(ALL_DATA_FILE))["train"]
     split = full_dataset.train_test_split(test_size=0.20, seed=SEED)
-
-    train_dataset = split["train"]
-    validation_dataset = split["test"]
-
-    print(f"Training examples:   {len(train_dataset)}")
-    print(f"Validation examples: {len(validation_dataset)}")
-
-    return train_dataset, validation_dataset
+    print(f"Training examples:   {len(split['train'])}")
+    print(f"Validation examples: {len(split['test'])}")
+    return split["train"], split["test"]
 
 
 def tokenize_dataset(raw_dataset, dataset_name: str):
-
     print(f"\nTokenizing {dataset_name}...")
 
-    tokenized_dataset = raw_dataset.map(
+    tokenized = raw_dataset.map(
         format_and_tokenize,
         batched=True,
         remove_columns=raw_dataset.column_names,
         desc=f"Tokenizing {dataset_name}",
     )
 
-    sequence_lengths = []
-    bad_indices = []
-
-    for i, labels in enumerate(tokenized_dataset["labels"]):
-
-        trainable_tokens = sum(1 for token in labels if token != -100)
-
-        if trainable_tokens <= 0:
-            bad_indices.append(i)
-
-        sequence_lengths.append(len(labels))
+    lengths     = [len(lbl) for lbl in tokenized["labels"]]
+    bad_indices = [
+        i for i, lbl in enumerate(tokenized["labels"])
+        if sum(1 for t in lbl if t != -100) <= 0
+    ]
 
     if bad_indices:
         raise RuntimeError(
@@ -409,11 +316,11 @@ def tokenize_dataset(raw_dataset, dataset_name: str):
         )
 
     print(f"✓ {dataset_name} tokenized")
-    print(f"  min length:  {min(sequence_lengths)}")
-    print(f"  max length:  {max(sequence_lengths)}")
-    print(f"  mean length: {np.mean(sequence_lengths):.2f}")
+    print(f"  min length:  {min(lengths)}")
+    print(f"  max length:  {max(lengths)}")
+    print(f"  mean length: {np.mean(lengths):.2f}")
 
-    return tokenized_dataset
+    return tokenized
 
 
 # ============================================================================
@@ -421,64 +328,42 @@ def tokenize_dataset(raw_dataset, dataset_name: str):
 # ============================================================================
 
 def run_stability_test(model, data_collator, tokenized_train):
-
     print_header("ONE-BATCH NUMERICAL STABILITY TEST")
 
-    example = tokenized_train[0]
-
-    batch = data_collator([example])
-
-    # Move tensors to LUMI GPU.
+    batch = data_collator([tokenized_train[0]])
     batch = {k: v.to("cuda") for k, v in batch.items()}
 
     model.train()
     model.zero_grad(set_to_none=True)
 
     print("Running forward pass...")
-
     outputs = model(**batch)
-    loss = outputs.loss
-
+    loss    = outputs.loss
     print(f"Initial loss: {loss.item():.8f}")
-    print(f"Loss finite: {torch.isfinite(loss).item()}")
+    print(f"Loss finite:  {torch.isfinite(loss).item()}")
 
     if not torch.isfinite(loss):
-        raise RuntimeError(
-            "INITIAL LOSS IS NaN/Inf.\n"
-            "Training stopped before Trainer.train()."
-        )
+        raise RuntimeError("INITIAL LOSS IS NaN/Inf. Training aborted.")
 
     print("Running backward pass...")
-
     loss.backward()
 
-    bad_gradients = []
-    checked = 0
-
-    for name, parameter in model.named_parameters():
-
-        if not parameter.requires_grad:
-            continue
-
-        if parameter.grad is None:
-            continue
-
-        checked += 1
-
-        if not torch.isfinite(parameter.grad).all():
-            bad_gradients.append(name)
-
+    bad_grads = [
+        name for name, p in model.named_parameters()
+        if p.requires_grad and p.grad is not None
+        and not torch.isfinite(p.grad).all()
+    ]
+    checked = sum(
+        1 for p in model.parameters()
+        if p.requires_grad and p.grad is not None
+    )
     print(f"Gradient tensors checked: {checked}")
 
-    if bad_gradients:
-        print("\nNaN/Inf gradients detected:")
-        for name in bad_gradients[:20]:
-            print(f"  {name}")
-        raise RuntimeError(
-            "NaN/Inf gradient detected during the first backward pass."
-        )
+    if bad_grads:
+        for name in bad_grads[:20]:
+            print(f"  NaN/Inf grad: {name}")
+        raise RuntimeError("NaN/Inf gradient detected in first backward pass.")
 
-    # Clear before Trainer.train().
     model.zero_grad(set_to_none=True)
     torch.cuda.empty_cache()
 
@@ -499,7 +384,6 @@ def main():
     print("LUMI / AMD ROCm")
     print(f"Model: {MODEL_NAME}")
 
-    # Reproducibility.
     set_seed(SEED)
     random.seed(SEED)
     np.random.seed(SEED)
@@ -507,28 +391,22 @@ def main():
     # ------------------------------------------------------------------------
     # 1. Environment
     # ------------------------------------------------------------------------
-
     print_header("[1/6] ENVIRONMENT")
     check_environment()
 
     # ------------------------------------------------------------------------
     # 2. Tokenizer
     # ------------------------------------------------------------------------
-
     print_header("[2/6] TOKENIZER")
 
-    # trust_remote_code=True is mandatory for DeepSeek-V2 family.
     tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_NAME,
-        trust_remote_code=True,
+        MODEL_NAME, trust_remote_code=True
     )
 
-    # DeepSeek tokenizer may not have a pad token defined.
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token    = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # Right-padding keeps attention masks aligned with labels during training.
     tokenizer.padding_side = "right"
 
     print(f"Vocab size:  {tokenizer.vocab_size}")
@@ -537,38 +415,32 @@ def main():
     print(f"BOS token:   {tokenizer.bos_token!r}  (id={tokenizer.bos_token_id})")
     print("✓ Tokenizer loaded")
 
-    # Quick sanity-check: verify the chat template applies without error.
-    _test_ids = tokenizer.apply_chat_template(
+    _test = tokenizer.apply_chat_template(
         [{"role": "user", "content": "ping"}],
-        tokenize=True,
-        add_generation_prompt=True,
+        tokenize=True, add_generation_prompt=True,
     )
-    print(f"✓ Chat template smoke-test: {len(_test_ids)} tokens")
+    print(f"✓ Chat template smoke-test: {len(_test)} tokens")
 
     # ------------------------------------------------------------------------
     # 3. Model
     # ------------------------------------------------------------------------
-
     print_header("[3/6] MODEL")
 
-    # trust_remote_code=True is required: DeepSeek-V2 registers custom
-    # classes (DeepseekV2Attention, MoE router, etc.) at load time.
+    # attn_implementation="eager" is the only option supported by
+    # DeepseekV2ForCausalLM in transformers 4.41.2.
+    # "sdpa" raises ValueError; "flash_attention_2" requires flash_attn.
+    # The get_imports patch above removes flash_attn from the static
+    # dependency check so this load succeeds cleanly.
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
-        attn_implementation="sdpa",
+        attn_implementation="eager",
     )
 
-    # One allocated GCD = one visible HIP/CUDA device.
-    # DO NOT use device_map="auto" here.
     model = model.to("cuda")
-
-    # Disable KV-cache during training.
     model.config.use_cache = False
-
-    # Required when gradient checkpointing is used with frozen embeddings.
     model.enable_input_require_grads()
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -578,18 +450,8 @@ def main():
     # ------------------------------------------------------------------------
     # 4. LoRA
     # ------------------------------------------------------------------------
-
     print_header("[4/6] LoRA")
 
-    # DeepSeek-Coder-V2-Lite uses the DeepseekV2 architecture.
-    # The attention projections are named identically to Qwen/LLaMA.
-    # The MoE MLP layers use "gate_proj", "up_proj", "down_proj" inside
-    # each expert; targeting them via LoRA is optional but beneficial for
-    # code-generation tasks.  On a single 80 GiB GCD all 7 modules fit
-    # within memory at rank 16.
-    #
-    # If you see OOM errors, remove "gate_proj", "up_proj", "down_proj"
-    # from target_modules and retrain with attention-only LoRA.
     lora_config = LoraConfig(
         r=LORA_RANK,
         lora_alpha=LORA_ALPHA,
@@ -613,15 +475,14 @@ def main():
     # ------------------------------------------------------------------------
     # 5. Dataset
     # ------------------------------------------------------------------------
-
     print_header("[5/6] DATASET")
 
     raw_train, raw_validation = load_datasets()
 
-    validate_raw_dataset(raw_train, "Training dataset")
+    validate_raw_dataset(raw_train,      "Training dataset")
     validate_raw_dataset(raw_validation, "Validation dataset")
 
-    train_dataset = tokenize_dataset(raw_train, "Training dataset")
+    train_dataset      = tokenize_dataset(raw_train,      "Training dataset")
     validation_dataset = tokenize_dataset(raw_validation, "Validation dataset")
 
     data_collator = DataCollatorForSeq2Seq(
@@ -634,7 +495,6 @@ def main():
     # ------------------------------------------------------------------------
     # 6. Trainer
     # ------------------------------------------------------------------------
-
     print_header("[6/6] TRAINER")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -647,17 +507,14 @@ def main():
         num_train_epochs=NUM_EPOCHS,
 
         per_device_train_batch_size=BATCH_SIZE,
-
         per_device_eval_batch_size=1,
 
         gradient_accumulation_steps=GRADIENT_ACCUMULATION,
 
         learning_rate=LEARNING_RATE,
-
         weight_decay=WEIGHT_DECAY,
 
         warmup_steps=WARMUP_STEPS,
-
         lr_scheduler_type=LR_SCHEDULER,
 
         bf16=True,
@@ -671,8 +528,6 @@ def main():
         logging_strategy="steps",
         logging_steps=1,
         logging_first_step=True,
-
-        # Do not hide NaN/Inf losses.
         logging_nan_inf_filter=False,
 
         eval_strategy="epoch",
@@ -690,8 +545,9 @@ def main():
         seed=SEED,
         data_seed=SEED,
 
+        # Keep at 0: forking after tokenizer parallelism is active causes
+        # deadlocks / excessive warning spam that stalls progress reporting.
         dataloader_num_workers=0,
-
         dataloader_prefetch_factor=None,
 
         remove_unused_columns=False,
@@ -718,9 +574,8 @@ def main():
     print(f"Epochs:               {NUM_EPOCHS}")
 
     # ------------------------------------------------------------------------
-    # Stability test BEFORE real training.
+    # Stability test BEFORE real training
     # ------------------------------------------------------------------------
-
     run_stability_test(
         model=model,
         data_collator=data_collator,
@@ -730,44 +585,34 @@ def main():
     # ------------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------------
-
     print_header("STARTING TRAINING")
 
-    train_result = trainer.train()
-
+    train_result  = trainer.train()
     training_loss = float(train_result.training_loss)
 
     print(f"\nTraining loss: {training_loss:.8f}")
 
     if not math.isfinite(training_loss):
-        raise RuntimeError(
-            f"Training ended with non-finite loss: {training_loss}"
-        )
+        raise RuntimeError(f"Training ended with non-finite loss: {training_loss}")
 
     # ------------------------------------------------------------------------
-    # Save BEST adapter
+    # Save best adapter
     # ------------------------------------------------------------------------
-
     print_header("SAVING BEST LoRA ADAPTER")
 
     FINAL_ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Because load_best_model_at_end=True, Trainer has already
-    # restored the best checkpoint before we reach this point.
     trainer.save_model(str(FINAL_ADAPTER_DIR))
     tokenizer.save_pretrained(str(FINAL_ADAPTER_DIR))
 
     print(f"✓ LoRA adapter saved to:\n  {FINAL_ADAPTER_DIR}")
 
     # ------------------------------------------------------------------------
-    # Final validation loss
+    # Final validation
     # ------------------------------------------------------------------------
-
     print_header("FINAL VALIDATION")
 
     eval_metrics = trainer.evaluate()
-
-    eval_loss = eval_metrics.get("eval_loss")
+    eval_loss    = eval_metrics.get("eval_loss")
 
     if eval_loss is None:
         raise RuntimeError("Trainer did not return eval_loss.")
@@ -775,63 +620,53 @@ def main():
     eval_loss = float(eval_loss)
 
     if not math.isfinite(eval_loss):
-        raise RuntimeError(
-            f"FINAL VALIDATION LOSS IS NaN/Inf: {eval_loss}"
-        )
+        raise RuntimeError(f"FINAL VALIDATION LOSS IS NaN/Inf: {eval_loss}")
 
     perplexity = math.exp(eval_loss)
-
     print(f"Validation loss: {eval_loss:.8f}")
     print(f"Perplexity:      {perplexity:.8f}")
 
     # ------------------------------------------------------------------------
     # Save report
     # ------------------------------------------------------------------------
-
-    timestamp = datetime.now().isoformat()
-
     report = {
-        "timestamp": timestamp,
-        "model": MODEL_NAME,
-        "adapter_directory": str(FINAL_ADAPTER_DIR),
-        "lora_rank": LORA_RANK,
-        "lora_alpha": LORA_ALPHA,
-        "lora_dropout": LORA_DROPOUT,
-        "learning_rate": LEARNING_RATE,
-        "batch_size": BATCH_SIZE,
+        "timestamp":            datetime.now().isoformat(),
+        "model":                MODEL_NAME,
+        "adapter_directory":    str(FINAL_ADAPTER_DIR),
+        "lora_rank":            LORA_RANK,
+        "lora_alpha":           LORA_ALPHA,
+        "lora_dropout":         LORA_DROPOUT,
+        "learning_rate":        LEARNING_RATE,
+        "batch_size":           BATCH_SIZE,
         "gradient_accumulation": GRADIENT_ACCUMULATION,
         "effective_batch_size": BATCH_SIZE * GRADIENT_ACCUMULATION,
-        "epochs": NUM_EPOCHS,
-        "max_sequence_length": MAX_SEQ_LENGTH,
-        "max_grad_norm": MAX_GRAD_NORM,
-        "training_examples": len(train_dataset),
-        "validation_examples": len(validation_dataset),
-        "training_loss": training_loss,
-        "validation_loss": eval_loss,
-        "perplexity": perplexity,
-        "evaluation_metrics": eval_metrics,
-        "log_history": trainer.state.log_history,
+        "epochs":               NUM_EPOCHS,
+        "max_sequence_length":  MAX_SEQ_LENGTH,
+        "max_grad_norm":        MAX_GRAD_NORM,
+        "training_examples":    len(train_dataset),
+        "validation_examples":  len(validation_dataset),
+        "training_loss":        training_loss,
+        "validation_loss":      eval_loss,
+        "perplexity":           perplexity,
+        "evaluation_metrics":   eval_metrics,
+        "log_history":          trainer.state.log_history,
     }
 
     metrics_file = RESULTS_DIR / "final_training_evaluation.json"
-
-    with metrics_file.open("w", encoding="utf-8") as file:
-        json.dump(report, file, indent=2, ensure_ascii=False)
+    with metrics_file.open("w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
 
     print(f"✓ Report saved to:\n  {metrics_file}")
 
     # ------------------------------------------------------------------------
-    # Complete
+    # Done
     # ------------------------------------------------------------------------
-
     print_header("TRAINING COMPLETE")
-
     print("✓ Stability test passed")
     print("✓ Training loss is finite")
     print("✓ Validation loss is finite")
     print(f"✓ Adapter:\n  {FINAL_ADAPTER_DIR}")
-    print("\nNext step:")
-    print("Run evaluate_deepseek.py separately.")
+    print("\nNext step: Run evaluate_deepseek.py separately.")
 
 
 if __name__ == "__main__":
