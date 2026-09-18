@@ -558,7 +558,7 @@ def main():
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
-        attn_implementation="eager",
+        attn_implementation="sdpa",
     )
 
     # One allocated GCD = one visible HIP/CUDA device.
@@ -690,7 +690,9 @@ def main():
         seed=SEED,
         data_seed=SEED,
 
-        dataloader_num_workers=2,
+        dataloader_num_workers=0,
+
+        dataloader_prefetch_factor=None,
 
         remove_unused_columns=False,
     )

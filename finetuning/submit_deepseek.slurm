@@ -37,6 +37,15 @@ export CUDA_VISIBLE_DEVICES=0
 # Helps PyTorch memory allocation.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+# Force hipBLAS to use the fastest available GEMM algorithm
+export ROCBLAS_TENSILE_LIBPATH=/opt/rocm/lib/rocblas/library
+export HIPBLAS_TENSILE_LIBPATH=/opt/rocm/lib/rocblas/library
+
+export TOKENIZERS_PARALLELISM=false
+
+# Let PyTorch pick the best matmul algorithm
+export TORCH_ROCM_AMDGPU_TARGETS="gfx90a"
+
 # DeepSeek-V2 uses custom CUDA/HIP kernels loaded via trust_remote_code.
 # Silence the Transformers warning that flags remote code execution.
 export TRUST_REMOTE_CODE=1
