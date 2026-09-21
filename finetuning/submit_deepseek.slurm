@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus-per-node=1
 #SBATCH --mem=120G
-#SBATCH --time=09:00:00
+#SBATCH --time=72:00:00
 #SBATCH --output=/project/project_465003167/m10-testbot/finetuning/logs/slurm-deepseek-%j.out
 #SBATCH --error=/project/project_465003167/m10-testbot/finetuning/logs/slurm-deepseek-%j.err
 
