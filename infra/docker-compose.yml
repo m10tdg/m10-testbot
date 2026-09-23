@@ -1,5 +1,4 @@
 services:
-
   postgres:
     image: postgres:16
     restart: unless-stopped
@@ -44,7 +43,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "kafka-topics --bootstrap-server localhost:29092 --list >/dev/null 2>&1"
+          "kafka-topics --bootstrap-server localhost:29092 --list >/dev/null 2>&1",
         ]
       interval: 15s
       timeout: 10s
@@ -71,7 +70,11 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD-SHELL", "sh -c 'exec 3<>/dev/tcp/127.0.0.1/6333' >/dev/null 2>&1 && echo 0 || echo 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "sh -c 'exec 3<>/dev/tcp/127.0.0.1/6333' >/dev/null 2>&1 && echo 0 || echo 1",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -86,6 +89,7 @@ services:
       - "127.0.0.1:4566:4566"
     volumes:
       - localstack_data:/var/lib/localstack
+      - ./init-localstack:/etc/localstack/init/ready.d
     healthcheck:
       test: ["CMD", "awslocal", "s3", "ls"]
       interval: 10s
@@ -185,6 +189,7 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
       AWS_REGION: ${AWS_REGION}
       S3_ARTIFACTS_BUCKET: ${S3_ARTIFACTS_BUCKET}
+      S3_DOCUMENTS_BUCKET: ${S3_DOCUMENTS_BUCKET}
 
       OPENAI_API_KEY: ${OPENAI_API_KEY}
     depends_on:
@@ -201,7 +206,3 @@ volumes:
   pg_data:
   qdrant_data:
   localstack_data:
-
-
-    
-

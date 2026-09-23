@@ -24,7 +24,7 @@ s3 = boto3.client(
 )
 
 ARTIFACTS_BUCKET = os.environ["S3_ARTIFACTS_BUCKET"]
-
+DOCUMENTS_BUCKET = os.environ["S3_DOCUMENTS_BUCKET"]
 
 def embed(text: str) -> list[float]:
     resp = openai.embeddings.create(model="text-embedding-3-small", input=text)

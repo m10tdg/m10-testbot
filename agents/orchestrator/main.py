@@ -18,44 +18,52 @@ load_dotenv()
 
 from kafka import KafkaConsumer, KafkaProducer
 from graph import build_graph
+from botocore.exceptions import ClientError
 
 # ============================================================================
 # VALIDATION: Ensure all infrastructure is ready before processing
 # ============================================================================
 
 def validate_infrastructure():
-    """Verify S3, Qdrant, PostgreSQL, and Kafka are accessible."""
-    from clients import s3, qdrant, pg_conn, ARTIFACTS_BUCKET
+    from clients import s3, qdrant, pg_conn, ARTIFACTS_BUCKET, DOCUMENTS_BUCKET
     import os
-    
+
     print("[orchestrator] validating infrastructure...")
-    
-    # 1. Test S3 connection and bucket
+
+    # 1. Test S3 connection and buckets
     try:
         s3.list_buckets()
         print("  ✓ S3 connection OK")
-        
-        # Ensure artifacts bucket exists
-        try:
-            s3.head_bucket(Bucket=ARTIFACTS_BUCKET)
-            print(f"  ✓ Bucket '{ARTIFACTS_BUCKET}' exists")
-        except Exception as e:
-            print(f"  ✗ Bucket '{ARTIFACTS_BUCKET}' missing. Creating...")
-            region = os.environ.get("AWS_REGION", "eu-central-1")
-            
-            # For non-us-east-1 regions, specify LocationConstraint
-            if region != "us-east-1":
-                s3.create_bucket(
-                    Bucket=ARTIFACTS_BUCKET,
-                    CreateBucketConfiguration={"LocationConstraint": region}
-                )
-            else:
-                s3.create_bucket(Bucket=ARTIFACTS_BUCKET)
-            
-            print(f"  ✓ Created bucket '{ARTIFACTS_BUCKET}' in {region}")
     except Exception as e:
         print(f"  ✗ S3 error: {e}")
         sys.exit(1)
+
+    region = os.environ.get("AWS_REGION", "eu-central-1")
+
+    for bucket in (ARTIFACTS_BUCKET, DOCUMENTS_BUCKET):
+        try:
+            s3.head_bucket(Bucket=bucket)
+            print(f"  ✓ Bucket '{bucket}' exists")
+        except ClientError as e:
+            error_code = e.response["Error"]["Code"]
+            if error_code in ("404", "NoSuchBucket"):
+                print(f"  ✗ Bucket '{bucket}' missing. Creating...")
+                try:
+                    if region != "us-east-1":
+                        s3.create_bucket(
+                            Bucket=bucket,
+                            CreateBucketConfiguration={"LocationConstraint": region},
+                        )
+                    else:
+                        s3.create_bucket(Bucket=bucket)
+                    print(f"  ✓ Created bucket '{bucket}' in {region}")
+                except Exception as create_err:
+                    print(f"  ✗ Failed to create bucket '{bucket}': {create_err}")
+                    sys.exit(1)
+            else:
+                print(f"  ✗ S3 error checking bucket '{bucket}': {e}")
+                sys.exit(1)
+
     
     # 2. Test Qdrant connection
     try:
