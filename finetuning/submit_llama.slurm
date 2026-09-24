@@ -5,10 +5,10 @@
 #SBATCH --partition=small-g
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=56
-#SBATCH --gpus-per-node=8
-#SBATCH --mem=480G
-#SBATCH --time=168:00:00
+#SBATCH --cpus-per-task=7
+#SBATCH --gpus-per-node=1
+#SBATCH --mem=60G
+#SBATCH --time=72:00:00
 #SBATCH --output=/project/project_465003167/m10-testbot/finetuning/logs/slurm-llama-%j.out
 #SBATCH --error=/project/project_465003167/m10-testbot/finetuning/logs/slurm-llama-%j.err
 

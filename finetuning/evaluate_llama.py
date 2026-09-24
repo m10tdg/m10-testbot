@@ -32,7 +32,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 PROJECT_DIR = Path("/project/project_465003167/m10-testbot/finetuning")
 
-BASE_MODEL    = "meta-llama/Llama-3.3-70B-Instruct"
+BASE_MODEL    = "meta-llama/Llama-3.1-8B-Instruct"
 ADAPTER_DIR   = PROJECT_DIR / "llama-finetuned-final"
 VAL_FILE      = PROJECT_DIR / "dataset" / "validation_data.jsonl"
 OUTPUT_DIR    = PROJECT_DIR / "training_results"

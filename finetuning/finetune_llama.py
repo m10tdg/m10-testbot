@@ -61,7 +61,7 @@ RESULTS_DIR       = PROJECT_DIR / "training_results"
 # MODEL / TRAINING CONFIGURATION
 # ============================================================================
 
-MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
+MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
 
 LORA_RANK    = 16
 LORA_ALPHA   = 32
