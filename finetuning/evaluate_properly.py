@@ -168,5 +168,5 @@ def evaluate_predictions(predictions_file):
 
 if __name__ == '__main__':
     results, per_example = evaluate_predictions(
-        'training_results/evaluation_deepseek_finetuned.json'
+        'training_results/evaluation_finetuned.json'
     )
