@@ -69,7 +69,7 @@ module load rocm
 # separate venv.
 # ============================================================================
 
-VENV_PATH="/project/project_465003167/m10-testbot/finetuning/llama-finetune-env"
+VENV_PATH="/project/project_465003167/m10-testbot/finetuning/qwen-finetune-env"
 source "${VENV_PATH}/bin/activate"
 
 # ============================================================================
