@@ -8,6 +8,12 @@ Uses the same validation dataset and task metrics as the DeepSeek evaluator:
   - exact match against reference output
 
 The base model is loaded in BF16 and the saved LoRA adapter is attached.
+
+IMPORTANT:
+BASE_MODEL must be the exact same repository used in finetune_llama.py
+(i.e. the same value you passed as LLAMA_MODEL_NAME during training),
+otherwise the LoRA adapter's target modules / tokenizer will not line up
+with the base weights.
 """
 
 import json
@@ -30,11 +36,13 @@ PROJECT_DIR = Path(
     "/project/project_465003167/m10-testbot/finetuning"
 )
 
-# Override with:
-#   export LLAMA_MODEL_NAME="your-org/your-model"
+# This is a PLACEHOLDER value. Override with:
+#   export LLAMA_MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
+# It must match whatever LLAMA_MODEL_NAME was set to during training.
+_PLACEHOLDER_BASE_MODEL = "your-org/Llama-3.1-8B-Instruct"
 BASE_MODEL = os.environ.get(
     "LLAMA_MODEL_NAME",
-    "your-org/Llama-3.3-8B-Instruct",
+    _PLACEHOLDER_BASE_MODEL,
 )
 
 ADAPTER_DIR = PROJECT_DIR / "llama-finetuned-final"
@@ -141,10 +149,12 @@ def main():
     print(f"Val file:   {VAL_FILE}")
     print(f"Output:     {OUTPUT_FILE}")
 
-    if BASE_MODEL.startswith("your-org/"):
+    if BASE_MODEL == _PLACEHOLDER_BASE_MODEL:
         raise RuntimeError(
-            "BASE_MODEL is still a placeholder. Set LLAMA_MODEL_NAME "
-            "to the exact model repository used for fine-tuning."
+            "BASE_MODEL is still a placeholder. Set the LLAMA_MODEL_NAME "
+            "environment variable to the exact model repository used "
+            "for fine-tuning, e.g. "
+            "'export LLAMA_MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct'."
         )
 
     if not ADAPTER_DIR.exists():
