@@ -69,7 +69,7 @@ RESULTS_DIR = PROJECT_DIR / "training_results"
 # You can override this without editing the file:
 #   export LLAMA_MODEL_NAME="your-org/your-llama-3.3-8b-model"
 #
-MODEL_NAME = "your-org/Llama-3.3-8B-Instruct"
+MODEL_NAME = "meta-llama/Llama-3.3-8B-Instruct"
 
 # ============================================================================
 # LoRA / TRAINING CONFIGURATION
