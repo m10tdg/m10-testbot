@@ -23,6 +23,7 @@ It:
 
 import json
 import math
+import os
 import random
 from datetime import datetime
 from pathlib import Path
@@ -59,7 +60,8 @@ RESULTS_DIR = PROJECT_DIR / "training_results"
 # MODEL
 # ============================================================================
 
-# Set this to the exact Llama 3.3 8B repository you intend to use.
+# This is a PLACEHOLDER value. The script refuses to run with this exact
+# value still in place, to force you to consciously choose a model.
 #
 # IMPORTANT:
 # There is no official Meta "Llama 3.3 8B" release. If you actually mean
@@ -69,7 +71,8 @@ RESULTS_DIR = PROJECT_DIR / "training_results"
 # You can override this without editing the file:
 #   export LLAMA_MODEL_NAME="your-org/your-llama-3.3-8b-model"
 #
-MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+_PLACEHOLDER_MODEL_NAME = "REPLACE_ME/llama-3.3-8b-model"
+MODEL_NAME = os.environ.get("LLAMA_MODEL_NAME", _PLACEHOLDER_MODEL_NAME)
 
 # ============================================================================
 # LoRA / TRAINING CONFIGURATION
@@ -441,25 +444,18 @@ def run_stability_test(model, data_collator, tokenized_train):
 
 def main():
     global tokenizer
-    global MODEL_NAME
 
     print_header("LLAMA LoRA FINE-TUNING")
     print("LUMI / AMD ROCm")
     print(f"Model: {MODEL_NAME}")
 
-    if MODEL_NAME.startswith("meta-llama/"):
+    if MODEL_NAME == _PLACEHOLDER_MODEL_NAME:
         raise RuntimeError(
-            "MODEL_NAME is still a placeholder. Set LLAMA_MODEL_NAME "
-            "or edit MODEL_NAME to the exact model repository."
+            "MODEL_NAME is still a placeholder. Set the LLAMA_MODEL_NAME "
+            "environment variable (e.g. "
+            "'export LLAMA_MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct') "
+            "or edit _PLACEHOLDER_MODEL_NAME's default assignment above."
         )
-
-    # Allow SLURM environment override.
-    import os
-
-    model_override = os.environ.get("LLAMA_MODEL_NAME")
-    if model_override:
-        MODEL_NAME = model_override
-        print(f"Using LLAMA_MODEL_NAME override: {MODEL_NAME}")
 
     set_seed(SEED)
     random.seed(SEED)
