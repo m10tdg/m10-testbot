@@ -441,6 +441,7 @@ def run_stability_test(model, data_collator, tokenized_train):
 
 def main():
     global tokenizer
+    global MODEL_NAME
 
     print_header("LLAMA LoRA FINE-TUNING")
     print("LUMI / AMD ROCm")
