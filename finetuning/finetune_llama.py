@@ -446,7 +446,7 @@ def main():
     print("LUMI / AMD ROCm")
     print(f"Model: {MODEL_NAME}")
 
-    if MODEL_NAME.startswith("your-org/"):
+    if MODEL_NAME.startswith("meta-llama/"):
         raise RuntimeError(
             "MODEL_NAME is still a placeholder. Set LLAMA_MODEL_NAME "
             "or edit MODEL_NAME to the exact model repository."
