@@ -39,7 +39,7 @@ PROJECT_DIR = Path(
 # This is a PLACEHOLDER value. Override with:
 #   export LLAMA_MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
 # It must match whatever LLAMA_MODEL_NAME was set to during training.
-_PLACEHOLDER_BASE_MODEL = "your-org/Llama-3.1-8B-Instruct"
+_PLACEHOLDER_BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 BASE_MODEL = os.environ.get(
     "LLAMA_MODEL_NAME",
     _PLACEHOLDER_BASE_MODEL,
