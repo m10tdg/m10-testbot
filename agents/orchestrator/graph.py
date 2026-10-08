@@ -18,28 +18,6 @@ from nodes.analysis import analysis_agent_node
 from nodes.reporting import reporting_agent_node
 
 
-def route_after_execution(state: RunState) -> str:
-    """
-    Route based on execution results.
-    
-    Success: visual_analysis → analysis → reporting
-    Failure: analysis (skip visual) → reporting
-    """
-    execution_results = state.get("execution_results", [])
-    
-    if execution_results:
-        result = execution_results[0]
-        if result.get("passed", False):
-            print("[graph] Execution passed, proceeding to visual analysis")
-            return "visual_analysis"
-        else:
-            print("[graph] Execution failed, skipping visual analysis")
-            return "analysis"
-    
-    # Default to analysis if no results (shouldn't happen)
-    return "analysis"
-
-
 def build_graph():
     """
     Build the LangGraph workflow with enhanced self-healing.
@@ -49,8 +27,8 @@ def build_graph():
     2. Scenario agent (generates test script, uses retry context if available)
     3. Execution (runs script, captures detailed errors)
     4. Route based on success/failure
-    5. Visual analysis (if passed) OR Analysis (if failed)
-    6. Analysis (root cause for failures)
+    5. Visual analysis (compares the captured screenshot when available)
+    6. Analysis (combines execution and visual findings)
     7. Reporting (generate HTML report)
     8. END
     
@@ -78,15 +56,9 @@ def build_graph():
     # Scenario → Execution (always)
     graph.add_edge("scenario", "execution")
     
-    # Conditional routing after execution
-    graph.add_conditional_edges(
-        "execution",
-        route_after_execution,
-        {
-            "visual_analysis": "visual_analysis",
-            "analysis": "analysis",
-        }
-    )
+    # Run visual analysis regardless of test pass/fail; failed runs still
+    # have useful screenshots for comparison when capture succeeded.
+    graph.add_edge("execution", "visual_analysis")
     
     # Visual analysis → Analysis (if execution passed)
     graph.add_edge("visual_analysis", "analysis")

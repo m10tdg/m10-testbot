@@ -231,6 +231,7 @@ REPORT_TEMPLATE = Template("""
             <div class="visual-diff">
                 <strong>{{ diff.page }}</strong>
                 <div style="margin-top: 8px; font-size: 13px;">
+                    <div>Baseline: {{ diff.baseline_source | default("project") }}</div>
                     <div>Pixel Difference: <strong>{{ diff.difference_percent }}%</strong></div>
                     <div class="verdict verdict-{{ diff.verdict }}">{{ diff.verdict | replace('_', ' ') | upper }}</div>
                 </div>

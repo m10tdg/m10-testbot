@@ -1,6 +1,8 @@
 import { v4 as uuid } from "uuid";
+import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { pool } from "../db.js";
 import { producer } from "../kafka.js";
+import { s3 } from "../s3.js";
 
 // This is the endpoint a developer, or a GitHub Actions / GitLab CI / Jenkins pipeline,
 // calls to kick off an AI test run. Same placeholder note as the other services:
@@ -13,11 +15,35 @@ export async function triggerRun(req, res) {
     }
 
     const runId = uuid();
+    const baseline = req.file;
+    let baselineS3Path = null;
+
+    if (baseline) {
+      const isPng = baseline.buffer.subarray(0, 8).equals(
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+      );
+      const isJpeg = baseline.buffer[0] === 0xff
+        && baseline.buffer[1] === 0xd8
+        && baseline.buffer[2] === 0xff;
+
+      if (!isPng && !isJpeg) {
+        return res.status(400).json({ error: "baseline must be a valid PNG or JPEG image" });
+      }
+
+      const extension = isPng ? "png" : "jpg";
+      baselineS3Path = `${tenantId}/${projectId}/${runId}/baseline.${extension}`;
+      await s3.send(new PutObjectCommand({
+        Bucket: process.env.S3_ARTIFACTS_BUCKET,
+        Key: baselineS3Path,
+        Body: baseline.buffer,
+        ContentType: isPng ? "image/png" : "image/jpeg",
+      }));
+    }
 
     await pool.query(
-      `INSERT INTO test_runs (id, tenant_id, project_id, run_source, url, prompt, status)
-       VALUES ($1,$2,$3,$4,$5,$6,'queued')`,
-      [runId, tenantId, projectId, runSource || "ui", url, prompt]
+      `INSERT INTO test_runs (id, tenant_id, project_id, run_source, url, prompt, status, baseline_s3_path)
+       VALUES ($1,$2,$3,$4,$5,$6,'queued',$7)`,
+      [runId, tenantId, projectId, runSource || "ui", url, prompt, baselineS3Path]
     );
 
     await producer.send({
@@ -27,6 +53,7 @@ export async function triggerRun(req, res) {
           eventType: "test.requested",
           tenantId, projectId, runId, url, prompt,
           runSource: runSource || "ui",
+          baselineS3Path,
           correlationId: uuid(),
           timestamp: new Date().toISOString(),
         }),
@@ -34,7 +61,7 @@ export async function triggerRun(req, res) {
     });
 
     // Returns immediately - the orchestrator processes this asynchronously.
-    res.status(202).json({ runId, status: "queued" });
+    res.status(202).json({ runId, status: "queued", baselineUploaded: Boolean(baselineS3Path) });
   } catch (err) {
     console.error("[ci-integration-service] triggerRun failed:", err);
     res.status(500).json({ error: err.message });

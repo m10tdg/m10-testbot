@@ -71,10 +71,10 @@ def visual_analysis_agent_node(state: dict) -> dict:
             print(f"[visual-analysis-agent] could not download current screenshot: {e}")
             continue
         
-        # Determine baseline key
-        # Use simplified URL as identifier: https://example.com/path → example.com
+        # A run-specific baseline takes precedence over the reusable URL baseline.
         baseline_name = page_url.split("://")[-1].split("/")[0]
-        baseline_key = f"{tenant_id}/{project_id}/baselines/{baseline_name}.png"
+        uploaded_baseline_key = state.get("baseline_s3_path")
+        baseline_key = uploaded_baseline_key or f"{tenant_id}/{project_id}/baselines/{baseline_name}.png"
         baseline_local = tempfile.NamedTemporaryFile(suffix=".png", delete=False).name
         
         baseline_exists = False
@@ -82,17 +82,21 @@ def visual_analysis_agent_node(state: dict) -> dict:
             # Try to download baseline
             s3.download_file(ARTIFACTS_BUCKET, baseline_key, baseline_local)
             baseline_exists = True
-            print(f"[visual-analysis-agent] baseline found, comparing...")
+            baseline_source = "uploaded" if uploaded_baseline_key else "project"
+            print(f"[visual-analysis-agent] {baseline_source} baseline found, comparing...")
         except ClientError as e:
             # Check if it's a "not found" error (first run scenario)
             error_code = e.response.get('Error', {}).get('Code', '')
-            if error_code in ['404', 'NoSuchKey', 'Not Found']:
+            if error_code in ['404', 'NoSuchKey', 'Not Found'] and not uploaded_baseline_key:
                 print(f"[visual-analysis-agent] no baseline found, creating one...")
                 try:
                     s3.upload_file(current_local, ARTIFACTS_BUCKET, baseline_key)
                     print(f"[visual-analysis-agent] baseline created at {baseline_key}")
                 except Exception as upload_err:
                     print(f"[visual-analysis-agent] could not save baseline: {upload_err}")
+                baseline_exists = False
+            elif error_code in ['404', 'NoSuchKey', 'Not Found']:
+                print(f"[visual-analysis-agent] uploaded baseline not found at {baseline_key}")
                 baseline_exists = False
             else:
                 print(f"[visual-analysis-agent] error accessing baseline: {e}")
@@ -182,6 +186,7 @@ Is this a real bug or expected design change?
                 "needs_review": needs_review,
                 "ai_analysis": ai_analysis,
                 "baseline_key": baseline_key,
+                "baseline_source": baseline_source,
             })
         
         except Exception as e:

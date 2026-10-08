@@ -271,6 +271,26 @@ curl -X POST http://localhost:4003/runs \
 
 **You should see:** `{"runId":"...","status":"queued"}`
 
+You can optionally attach a per-run visual baseline. Send the same fields as
+multipart form data and use the file field name `baseline` (PNG or JPEG, up to
+10 MB). The supplied image is compared with the screenshot captured during
+this run and does not replace the reusable project baseline:
+
+```bash
+curl -X POST http://localhost:4003/runs \
+  -F "tenantId=11111111-1111-1111-1111-111111111111" \
+  -F "projectId=<PROJECT_ID>" \
+  -F "url=https://example.com" \
+  -F "prompt=Validate the homepage loads and shows a heading" \
+  -F "runSource=ui" \
+  -F "baseline=@./homepage-baseline.png"
+```
+
+The original JSON request remains supported when no baseline is needed. If the
+database was created before baseline uploads were added, apply
+`infra/init-db/zzz-test-run-baseline-migration.sql` once to add the nullable
+`test_runs.baseline_s3_path` column; new database volumes apply it automatically.
+
 **Copy that `runId`.**
 
 ---

@@ -40,6 +40,7 @@ CREATE TABLE test_runs (
   run_source TEXT NOT NULL DEFAULT 'ui',
   url TEXT NOT NULL,
   prompt TEXT NOT NULL,
+  baseline_s3_path TEXT,
   status TEXT NOT NULL DEFAULT 'queued',
   created_at TIMESTAMPTZ DEFAULT now(),
   completed_at TIMESTAMPTZ

@@ -8,6 +8,7 @@ class RunState(TypedDict, total=False):
     url: str
     prompt: str
     correlation_id: str
+    baseline_s3_path: Optional[str]
     attempt: int
     max_attempts: int
     is_retry: bool

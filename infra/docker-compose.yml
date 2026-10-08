@@ -154,10 +154,17 @@ services:
       PORT: 4003
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       KAFKA_BROKER: kafka:29092
+      S3_ENDPOINT: http://localstack:4566
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION}
+      S3_ARTIFACTS_BUCKET: ${S3_ARTIFACTS_BUCKET}
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+      localstack:
         condition: service_healthy
     ports:
       - "127.0.0.1:4003:4003"

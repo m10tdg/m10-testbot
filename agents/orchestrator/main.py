@@ -181,6 +181,7 @@ def handle_test_requested(event: dict, attempt: int = 1):
         "url": event["url"],
         "prompt": event["prompt"],
         "correlation_id": event.get("correlationId"),
+        "baseline_s3_path": event.get("baselineS3Path"),
         "status": "queued",
         "attempt": attempt,
         "max_attempts": max_attempts,
