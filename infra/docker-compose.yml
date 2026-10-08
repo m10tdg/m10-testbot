@@ -12,33 +12,39 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
-      timeout: 5s
-      retries: 5
+      timeout: 15s
+      retries: 12
+      start_period: 5m
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     restart: unless-stopped
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 15s
+      retries: 12
+      start_period: 30s
 
   kafka:
     image: confluentinc/cp-kafka:7.6.0
     restart: unless-stopped
     depends_on:
       zookeeper:
-        condition: service_started
+        condition: service_healthy
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT
-      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092
-
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-
+    ports:
+      - "127.0.0.1:9092:9092"
     healthcheck:
       test:
         [
@@ -46,8 +52,9 @@ services:
           "kafka-topics --bootstrap-server localhost:29092 --list >/dev/null 2>&1",
         ]
       interval: 15s
-      timeout: 10s
-      retries: 10
+      timeout: 15s
+      retries: 12
+      start_period: 2m
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
@@ -58,6 +65,8 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME: production
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      LOGGING_LEVEL_ROOT: INFO
+      LOGGING_LEVEL_COM_PROVECTUS: INFO
     ports:
       - "127.0.0.1:8085:8080"
 
@@ -83,6 +92,7 @@ services:
     image: localstack/localstack:latest
     restart: unless-stopped
     environment:
+      LS_LOG: warn
       AWS_DEFAULT_REGION: ${AWS_REGION}
       LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN}
     ports:
@@ -93,8 +103,9 @@ services:
     healthcheck:
       test: ["CMD", "awslocal", "s3", "ls"]
       interval: 10s
-      timeout: 5s
-      retries: 5
+      timeout: 20s
+      retries: 12
+      start_period: 2m
 
   project-service:
     build:
@@ -120,7 +131,6 @@ services:
       PORT: 4002
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       KAFKA_BROKER: kafka:29092
-
       S3_ENDPOINT: http://localstack:4566
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
@@ -132,7 +142,7 @@ services:
       kafka:
         condition: service_healthy
       localstack:
-        condition: service_started
+        condition: service_healthy
     ports:
       - "127.0.0.1:4002:4002"
 
@@ -159,13 +169,11 @@ services:
     environment:
       KAFKA_BROKER: kafka:29092
       QDRANT_URL: http://qdrant:6333
-
       S3_ENDPOINT: http://localstack:4566
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
       AWS_REGION: ${AWS_REGION}
       S3_DOCUMENTS_BUCKET: ${S3_DOCUMENTS_BUCKET}
-
       OPENAI_API_KEY: ${OPENAI_API_KEY}
     depends_on:
       kafka:
@@ -173,7 +181,7 @@ services:
       qdrant:
         condition: service_healthy
       localstack:
-        condition: service_started
+        condition: service_healthy
 
   orchestrator:
     build:
@@ -183,14 +191,12 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       KAFKA_BROKER: kafka:29092
       QDRANT_URL: http://qdrant:6333
-
       S3_ENDPOINT: http://localstack:4566
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
       AWS_REGION: ${AWS_REGION}
       S3_ARTIFACTS_BUCKET: ${S3_ARTIFACTS_BUCKET}
       S3_DOCUMENTS_BUCKET: ${S3_DOCUMENTS_BUCKET}
-
       OPENAI_API_KEY: ${OPENAI_API_KEY}
     depends_on:
       postgres:
@@ -200,7 +206,7 @@ services:
       qdrant:
         condition: service_healthy
       localstack:
-        condition: service_started
+        condition: service_healthy
 
 volumes:
   pg_data:

@@ -68,6 +68,7 @@ REPORT_TEMPLATE = Template("""
         }
         .status-passed { background: #d4edda; color: #155724; }
         .status-failed { background: #f8d7da; color: #721c24; }
+        .status-completed { background: #d4edda; color: #155724; }
         .status-warning { background: #fff3cd; color: #856404; }
         .status-info { background: #d1ecf1; color: #0c5460; }
         
@@ -293,12 +294,14 @@ def reporting_agent_node(state: dict) -> dict:
     Generate a comprehensive HTML report with all findings.
     """
     print(f"\n[reporting-agent] building report for run {state['run_id']}")
+    execution_results = state.get("execution_results", [])
+    final_status = "failed" if any(not result.get("passed", True) for result in execution_results) else "completed"
     
     # Prepare data for template
     template_data = {
         "run_id": state["run_id"],
         "url": state.get("url", "Unknown"),
-        "status": state.get("status", "unknown"),
+        "status": final_status,
         "severity": state.get("severity", "info"),
         "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
         "execution_results": state.get("execution_results", []),
@@ -333,31 +336,27 @@ def reporting_agent_node(state: dict) -> dict:
     # Save metadata to PostgreSQL (optional - if table exists)
     try:
         with pg_conn.cursor() as cur:
-            # Insert report metadata
-            critical_count = 1 if state.get("severity") == "critical" else 0
-            warning_count = 1 if state.get("severity") == "warning" else 0
-            
-            cur.execute("""
-                INSERT INTO reports 
-                (tenant_id, project_id, run_id, status, severity, report_url, s3_path, format) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                tenant_id,
-                project_id,
-                run_id,
-                state.get("status", "completed"),
-                state.get("severity", "info"),
-                report_url, 
-                s3_path,
-                "html"
-            ))
+            if report_url:
+                cur.execute("""
+                    INSERT INTO reports
+                    (tenant_id, project_id, run_id, status, severity, report_url, s3_path, format)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    tenant_id,
+                    project_id,
+                    run_id,
+                    final_status,
+                    state.get("severity", "info"),
+                    report_url,
+                    s3_path,
+                    "html"
+                ))
 
-            # Try to update test_runs status
             cur.execute("""
                 UPDATE test_runs 
                 SET status = %s, completed_at = NOW()
                 WHERE id = %s
-            """, (state.get("status", "completed"), run_id))
+            """, (final_status, run_id))
             
             pg_conn.commit()
             print(f"[reporting-agent] updated test_runs for run {run_id}")
@@ -368,5 +367,5 @@ def reporting_agent_node(state: dict) -> dict:
     return {
         **state,
         "report_url": report_url,
-        "status": "completed",
+        "status": final_status,
     }

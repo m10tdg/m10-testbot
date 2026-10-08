@@ -10,6 +10,8 @@ class RunState(TypedDict, total=False):
     correlation_id: str
     attempt: int
     max_attempts: int
+    is_retry: bool
+    retry_context: dict
     
     # From crawler node
     page_structure: str
@@ -27,7 +29,7 @@ class RunState(TypedDict, total=False):
     visual_diffs: list[dict]
     
     # From analysis node
-    root_cause: str
+    root_cause: Optional[str]
     severity: str
     recommendation: str
     

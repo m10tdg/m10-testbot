@@ -139,10 +139,10 @@ def build_retry_context(event: dict, state: dict) -> dict:
     
     retry_context = {
         "attempt_number": state.get("attempt", 1),
+        "previous_script": state.get("playwright_script"),
         "previous_error": None,
         "previous_screenshot": None,
         "previous_dom": None,
-        "execution_log": [],
     }
     
     # Extract error details from execution results
@@ -197,7 +197,7 @@ def handle_test_requested(event: dict, attempt: int = 1):
         
         # Check if we should retry
         if should_retry(final_state, attempt, max_attempts):
-            retry_context = build_retry_context(event, final_state)
+            retry_context = build_retry_context(final_state)
             
             print(f"\n[orchestrator] SELF-HEALING TRIGGERED")
             print(f"[orchestrator] Error: {retry_context['previous_error']}")
