@@ -253,7 +253,9 @@ Remember:
 
         script_body = completion.choices[0].message.content.strip()
         script_body = script_body.removeprefix("```python").removeprefix("```").removesuffix("```").strip()
-
+        print("--------------------Script Body------------------------")
+        print(script_body)
+        print("--------------------------------------------")
         lines = script_body.split('\n')
         print(f"[scenario-agent] generated {len(lines)} lines of test code")
 

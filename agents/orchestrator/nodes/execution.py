@@ -27,7 +27,7 @@ class ElementFinder:
         self.page = page
         self.failed_selectors = []
     
-    def find_element(self, strategies: list, timeout: int = 5000) -> object:
+    def find_element(self, strategies: list, timeout: int = 15000) -> object:
         """
         Try multiple selector strategies in order until one succeeds.
         

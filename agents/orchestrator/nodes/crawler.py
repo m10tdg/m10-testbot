@@ -212,14 +212,14 @@ def crawler_node(state: dict) -> dict:
             page = browser.new_page()
             
             # Set a reasonable timeout
-            page.set_default_timeout(10000)  # 10 seconds
+            page.set_default_timeout(15000)  # 10 seconds
             
             # Navigate
             page.goto(url, wait_until="load")
             
             # Wait for network to settle
             try:
-                page.wait_for_load_state("networkidle", timeout=5000)
+                page.wait_for_load_state("networkidle", timeout=10000)
             except:
                 # If networkidle times out, proceed anyway
                 pass

@@ -198,7 +198,7 @@ def handle_test_requested(event: dict, attempt: int = 1):
         
         # Check if we should retry
         if should_retry(final_state, attempt, max_attempts):
-            retry_context = build_retry_context(final_state)
+            retry_context = build_retry_context(event, final_state)
             
             print(f"\n[orchestrator] SELF-HEALING TRIGGERED")
             print(f"[orchestrator] Error: {retry_context['previous_error']}")
