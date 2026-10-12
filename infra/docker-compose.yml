@@ -95,6 +95,7 @@ services:
       LS_LOG: warn
       AWS_DEFAULT_REGION: ${AWS_REGION}
       LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN}
+      PERSISTENCE: 1
     ports:
       - "127.0.0.1:4566:4566"
     volumes:
@@ -168,6 +169,28 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:4003:4003"
+
+  dashboard-service:
+    build:
+      context: ../services/dashboard-service
+    restart: unless-stopped
+    environment:
+      PORT: 4004
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      S3_ENDPOINT: http://localstack:4566
+      S3_PUBLIC_ENDPOINT: http://localhost:4566
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION}
+      S3_DOCUMENTS_BUCKET: ${S3_DOCUMENTS_BUCKET}
+      S3_ARTIFACTS_BUCKET: ${S3_ARTIFACTS_BUCKET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:4004:4004"
 
   embedding-service:
     build:

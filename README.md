@@ -333,3 +333,45 @@ curl http://localhost:4566/m10-artifacts/11111111-1111-1111-1111-111111111111/<P
 ```
 
 That's raw HTML — paste it into a `.html` file and open it in a browser to see it rendered.
+
+---
+
+## Dashboard API
+
+The dashboard service runs alongside the other services on port `4004`. It reads
+the existing Postgres tables and provides tenant-scoped project, run, report,
+document, and artifact data; no database migration is needed.
+
+```bash
+cd testbot/services/dashboard-service
+npm install
+npm start
+```
+
+Use the seeded tenant ID from Step 2 in these example requests:
+
+```bash
+# Dashboard counts and each project's document/run totals and latest run
+curl "http://localhost:4004/dashboard?tenantId=11111111-1111-1111-1111-111111111111"
+
+# Project metadata and counts
+curl "http://localhost:4004/projects/<PROJECT_ID>?tenantId=11111111-1111-1111-1111-111111111111"
+
+# Documents, test runs (optionally filter by status), and reports
+curl "http://localhost:4004/projects/<PROJECT_ID>/documents?tenantId=11111111-1111-1111-1111-111111111111"
+curl "http://localhost:4004/projects/<PROJECT_ID>/runs?tenantId=11111111-1111-1111-1111-111111111111&status=completed"
+curl "http://localhost:4004/reports?tenantId=11111111-1111-1111-1111-111111111111&projectId=<PROJECT_ID>"
+
+# A run's report metadata and downloadable run artifacts (report, screenshots, DOM)
+curl "http://localhost:4004/runs/<RUN_ID>?tenantId=11111111-1111-1111-1111-111111111111"
+curl "http://localhost:4004/runs/<RUN_ID>/artifacts?tenantId=11111111-1111-1111-1111-111111111111"
+```
+
+List endpoints accept `limit` (1–100, default 25) and `offset` (default 0).
+Document, report, and artifact responses include S3 download URLs that expire
+after 15 minutes. `S3_PUBLIC_ENDPOINT` controls the endpoint embedded in these
+URLs; set it to a host accessible to the browser when running outside the local
+Compose setup. Browser access is enabled by default; set `CORS_ORIGIN` to the
+dashboard's exact origin when deploying. As with the other services, `tenantId`
+is currently caller-supplied until authentication and tenant resolution are
+implemented; do not expose this API publicly without that protection.

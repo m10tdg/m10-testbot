@@ -15,7 +15,7 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from clients import s3, ARTIFACTS_BUCKET
 
-EXECUTION_TIMEOUT = 30000  # 30 seconds
+EXECUTION_TIMEOUT = 60000  # 30 seconds
 
 
 class ElementFinder:
@@ -27,7 +27,7 @@ class ElementFinder:
         self.page = page
         self.failed_selectors = []
     
-    def find_element(self, strategies: list, timeout: int = 15000) -> object:
+    def find_element(self, strategies: list, timeout: int = 30000) -> object:
         """
         Try multiple selector strategies in order until one succeeds.
         
@@ -154,7 +154,7 @@ def execution_agent_node(state: dict) -> dict:
                     # Try to extract which locator timed out
                     if "waiting for" in error_str.lower():
                         # Example: "Error: Timeout 30000ms exceeded. waiting for get_by_text(\"Log in\") to be visible"
-                        locator_part = error_str.split("waiting for")[-1].split("to")[0].strip()
+                        locator_part = error_str.split("waiting for")[-1].strip()
                         error_message = f"Timeout: element not found or not visible: {locator_part}"
                     else:
                         error_message = f"Timeout: {error_str[:150]}"
