@@ -16,6 +16,32 @@ services:
       retries: 12
       start_period: 5m
 
+  # Applies infra/migrations/*.sql (in name order) on every `docker compose up`,
+  # so existing database volumes pick up schema changes. Migrations must be idempotent.
+  db-migrate:
+    image: postgres:16
+    restart: "no"
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        for file in /migrations/*.sql; do
+          echo "[db-migrate] applying $$(basename "$$file")"
+          psql -v ON_ERROR_STOP=1 -q -f "$$file"
+        done
+        echo "[db-migrate] done"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     restart: unless-stopped
@@ -119,6 +145,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
       qdrant:
         condition: service_healthy
     ports:
@@ -140,6 +168,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
       kafka:
         condition: service_healthy
       localstack:
@@ -163,6 +193,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
       kafka:
         condition: service_healthy
       localstack:
@@ -187,10 +219,32 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
       localstack:
         condition: service_healthy
     ports:
       - "127.0.0.1:4004:4004"
+
+  auth-service:
+    build:
+      context: ../services/auth-service
+    restart: unless-stopped
+    environment:
+      PORT: 4005
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in infra/.env}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-8h}
+      INITIAL_OWNER_EMAIL: ${INITIAL_OWNER_EMAIL:-}
+      INITIAL_OWNER_PASSWORD: ${INITIAL_OWNER_PASSWORD:-}
+      INITIAL_OWNER_NAME: ${INITIAL_OWNER_NAME:-Platform Owner}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:4005:4005"
 
   embedding-service:
     build:
@@ -231,6 +285,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
       kafka:
         condition: service_healthy
       qdrant:

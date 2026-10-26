@@ -288,8 +288,8 @@ curl -X POST http://localhost:4003/runs \
 
 The original JSON request remains supported when no baseline is needed. If the
 database was created before baseline uploads were added, apply
-`infra/init-db/zzz-test-run-baseline-migration.sql` once to add the nullable
-`test_runs.baseline_s3_path` column; new database volumes apply it automatically.
+the `db-migrate` service adds the nullable `test_runs.baseline_s3_path` column
+automatically on the next `docker compose up`.
 
 **Copy that `runId`.**
 
@@ -375,3 +375,47 @@ Compose setup. Browser access is enabled by default; set `CORS_ORIGIN` to the
 dashboard's exact origin when deploying. As with the other services, `tenantId`
 is currently caller-supplied until authentication and tenant resolution are
 implemented; do not expose this API publicly without that protection.
+---
+
+## Auth Service (owner panel + tenant sign-in)
+
+The auth service runs on port `4005`. It handles two kinds of accounts:
+
+- **Platform owners** sign in at `/owner/login` in the frontend and register tenants,
+  each with its first admin.
+- **Tenant users** (starting with that admin) sign in at the regular `/login` page and
+  get access to the dashboard.
+
+Nothing needs to be run by hand: on every `docker compose up`, the one-shot
+`db-migrate` container applies `infra/migrations/*.sql` (in name order) before any
+service starts, and auth-service creates the first platform owner from these
+`infra/.env` variables if it does not exist yet:
+
+```bash
+INITIAL_OWNER_EMAIL=owner@m10.dev
+INITIAL_OWNER_PASSWORD=<choose-a-strong-password>
+INITIAL_OWNER_NAME=Platform Owner
+JWT_SECRET=<long-random-value>
+```
+
+The owner is never overwritten on restart. To change an owner's password, or to add
+more owners, run `npm run create-owner -- <email> <password> "<name>"` inside
+`services/auth-service` (it needs `DATABASE_URL` pointing at Postgres).
+
+New schema changes go in a new numbered file in `infra/migrations/` and must be
+idempotent (`IF NOT EXISTS`, etc.), since every migration re-runs on each `up`.
+
+**You should see:** `[auth-service] listening on http://localhost:4005`
+
+| Method | Path              | Auth         | Purpose                                  |
+| ------ | ----------------- | ------------ | ---------------------------------------- |
+| POST   | `/owner/login`    | none         | Owner sign-in, returns a JWT              |
+| GET    | `/owner/me`       | owner token  | Current owner                            |
+| GET    | `/owner/tenants`  | owner token  | List tenants with admin email/user count |
+| POST   | `/owner/tenants`  | owner token  | Create a tenant and its first admin      |
+| POST   | `/auth/login`     | none         | Tenant user sign-in, returns a JWT       |
+| GET    | `/auth/me`        | tenant token | Current user and tenant                  |
+
+Owner and tenant tokens use different JWT audiences, so a tenant token is rejected
+on owner routes. The other services do not verify these tokens yet and still take
+`tenantId` from the request.
